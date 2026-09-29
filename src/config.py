@@ -56,6 +56,10 @@ class Config:
     min_spread_bps: float = field(default_factory=lambda: _float("MIN_SPREAD_BPS", 5))
     max_spread_bps: float = field(default_factory=lambda: _float("MAX_SPREAD_BPS", 15))
     order_levels: int = field(default_factory=lambda: _int("ORDER_LEVELS", 2))
+    # Leave resting orders alone unless target price drifts more than this from them.
+    requote_bps: float = field(default_factory=lambda: _float("REQUOTE_BPS", 2))
+    # How far (bps) to shift the quote center against inventory when at MAX_POSITION_USD.
+    skew_bps_at_cap: float = field(default_factory=lambda: _float("SKEW_BPS_AT_CAP", 4))
 
     def is_mainnet(self) -> bool:
         return "mainnet" in self.base_url

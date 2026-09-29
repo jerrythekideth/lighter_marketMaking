@@ -69,3 +69,14 @@ def clamp_order_size(
     per-order cap either."""
     headroom = max_position_usd - abs(state.net_position_usd)
     return max(0.0, min(requested_usd, max_order_usd, headroom))
+
+
+def skewed_mid(mid: float, net_position_usd: float, max_position_usd: float, skew_bps_at_cap: float) -> float:
+    """Shift the quoting center against our inventory so fills tend to flatten us.
+    Short -> center moves up (bid closer to market to buy back, ask further away to sell less);
+    long -> center moves down. Linear in position, reaching skew_bps_at_cap at the position cap.
+    """
+    if max_position_usd <= 0:
+        return mid
+    ratio = max(-1.0, min(1.0, net_position_usd / max_position_usd))
+    return mid * (1 - ratio * skew_bps_at_cap / 1e4)
