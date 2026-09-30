@@ -26,6 +26,7 @@ import asyncio
 import datetime as dt
 import logging
 import os
+import re
 import signal
 import time
 
@@ -39,6 +40,7 @@ from src.trader import BotOrder, Trader
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("mm")
 
+_NUM = re.compile(r"\d+(\.\d+)?")
 ROOT = os.path.dirname(os.path.abspath(__file__))
 STOP_FILE = os.path.join(ROOT, "data", "STOP")
 
@@ -88,8 +90,11 @@ class Bot:
         return False
 
     def _set_status(self, symbol: str, market_id: int, status: str) -> None:
-        if self.status.get(market_id) != status:
-            self.status[market_id] = status
+        # Log on a change of kind, not every time a number inside the reason ticks
+        # ("mid 306bps from mark" -> "mid 302bps from mark", "... in 5m" -> "... in 4m").
+        changed = _NUM.sub("#", self.status.get(market_id, "")) != _NUM.sub("#", status)
+        self.status[market_id] = status
+        if changed:
             log.info("%s -> %s", symbol, status)
 
     async def _pull_market(self, symbol: str, market_id: int, why: str) -> None:

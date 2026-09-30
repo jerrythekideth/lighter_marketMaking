@@ -268,3 +268,14 @@ def test_wake_from_sleep_pulls_and_resyncs(bot):
     assert bot_orders(bot) == []
     assert getattr(bot.feed, "was_reset", False)
     assert bot.last_account_ok == 0.0 and bot._timers["dms"] == 0.0
+
+
+def test_status_logs_on_kind_change_only(bot, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger="mm")
+    bot._set_status("SOL", SOL.market_id, "WAIT (mid 306bps from mark)")
+    bot._set_status("SOL", SOL.market_id, "WAIT (mid 302bps from mark)")
+    bot._set_status("SOL", SOL.market_id, "QUOTING")
+    msgs = [r.getMessage() for r in caplog.records]
+    assert msgs == ["SOL -> WAIT (mid 306bps from mark)", "SOL -> QUOTING"]
+    assert bot.status[SOL.market_id] == "QUOTING"
