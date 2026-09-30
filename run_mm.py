@@ -16,7 +16,8 @@ Every LOOP_SECONDS:
      TxBudget; when budget is short, orders that became dangerous are cancelled (free).
 
 Safety nets: dead man's switch (Lighter scheduled cancel-all, 330s, refreshed every 60s);
-Ctrl-C / kill / STOP file / halt all cancel bot orders on the way out. Only bot-tagged
+Ctrl-C / kill / STOP file / halt all cancel bot orders on the way out, then (FLATTEN_ON_STOP)
+close every position with reduce-only market orders so the account ends in USDC only. Only bot-tagged
 orders are ever touched (see src/trader.py).
 
 Start:  nohup .venv/bin/python -u run_mm.py >> data/mm_live.log 2>&1 &
@@ -418,6 +419,16 @@ async def main() -> None:
             except Exception:
                 clear = False
                 log.exception("cancel on shutdown failed")
+            flat = True
+            if CONFIG.flatten_on_stop:
+                log.info("closing all positions so the account holds only USDC")
+                try:
+                    flat = await trader.flatten_all_positions()
+                except Exception:
+                    flat = False
+                    log.exception("flatten on shutdown failed — check positions in the Lighter UI")
+                if flat:
+                    log.info("all positions closed")
             # Only drop the safety net once we've confirmed our orders are gone.
             if clear:
                 await trader.disarm_dead_mans_switch()

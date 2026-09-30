@@ -92,6 +92,11 @@ class Config:
     # Stop quoting if the market-data websocket has been silent this long.
     feed_max_silence_s: float = field(default_factory=lambda: _float("FEED_MAX_SILENCE_S", 10))
 
+    # On a graceful stop (STOP file, Ctrl-C/kill, loss/error halt) close ALL positions on the
+    # account with reduce-only market orders so only USDC is held. Does not run if the process
+    # is killed hard (kill -9) or the machine sleeps — the dead man's switch only cancels orders.
+    flatten_on_stop: bool = field(default_factory=lambda: _bool("FLATTEN_ON_STOP", True))
+
     # --- pacing / quota ---
     loop_seconds: float = field(default_factory=lambda: _float("LOOP_SECONDS", 1.0))
     account_refresh_s: float = field(default_factory=lambda: _float("ACCOUNT_REFRESH_S", 3.0))

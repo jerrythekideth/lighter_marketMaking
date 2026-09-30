@@ -393,6 +393,64 @@ class Trader:
         else:
             log.info("dead man's switch disarmed")
 
+    async def flatten_all_positions(self, slippage_steps_bps: tuple[float, ...] = (100, 300)) -> bool:
+        """Close every open perp position on the account (not just bot markets) with
+        reduce-only market orders, so the account holds only USDC. Each attempt uses a worst
+        acceptable price of best bid/ask -/+ the slippage step; anything left after all steps
+        is reported and left alone rather than chased at any price. Returns True if flat."""
+        if self.cfg.dry_run:
+            acct = await self.account_snapshot()
+            for m, p in acct.positions.items():
+                if p.size:
+                    log.info("[DRY_RUN] would close %s %+g ($%.2f)", self._sym(m), p.size, p.value_usd)
+            return True
+        for step in slippage_steps_bps:
+            acct = await self.account_snapshot()
+            open_pos = {m: p for m, p in acct.positions.items() if p.size}
+            if not open_pos:
+                return True
+            for m, p in open_pos.items():
+                await self._close_position(m, p, step)
+            await asyncio.sleep(2)
+        acct = await self.account_snapshot()
+        left = {self._sym(m): p.size for m, p in acct.positions.items() if p.size}
+        if left:
+            log.error("could not fully flatten (slippage cap hit?) — still open: %s", left)
+            return False
+        return True
+
+    def _sym(self, market_id: int) -> str:
+        spec = self.specs.get(market_id)
+        return spec.symbol if spec else str(market_id)
+
+    async def _close_position(self, market_id: int, pos: "Position", slippage_bps: float) -> None:
+        spec = self.specs.get(market_id)
+        if spec is None:
+            log.error("can't close market %s: no spec", market_id)
+            return
+        book = await self._get("/api/v1/orderBookOrders", {"market_id": str(market_id), "limit": "1"})
+        is_ask = pos.size > 0  # long -> sell to close
+        side = (book.get("bids") if is_ask else book.get("asks")) or []
+        if not side:
+            log.error("can't close %s: no %s in the book", spec.symbol, "bids" if is_ask else "asks")
+            return
+        best = float(side[0]["price"])
+        worst = best * (1 - slippage_bps / 1e4) if is_ask else best * (1 + slippage_bps / 1e4)
+        price_int = self.to_price_int(market_id, worst, is_ask=not is_ask)  # round toward the book
+        base_int = round(abs(pos.size) * 10 ** spec.size_decimals)
+        _, resp, err = await self._client.create_market_order(
+            market_index=market_id,
+            client_order_index=self._next_coi(),
+            base_amount=base_int,
+            avg_execution_price=price_int,
+            is_ask=is_ask,
+            reduce_only=True,
+        )
+        self.budget.record(resp)
+        if self._tx_result(f"close {spec.symbol}", resp, err):
+            log.info("closing %s %+g ($%.2f) at market, worst price %s (%.0fbps)",
+                     spec.symbol, pos.size, pos.value_usd, price_int / 10 ** spec.price_decimals, slippage_bps)
+
     async def cancel_all_bot_orders(self, why: str) -> bool:
         """Cancel every bot order in every market; True if confirmed none remain."""
         if self.cfg.dry_run:

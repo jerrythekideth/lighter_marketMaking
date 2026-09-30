@@ -90,3 +90,69 @@ def test_spec_tradable():
     assert MarketSpec(1, "A", 1, 1, 1, 1, "active", False, 0.1).tradable
     assert not MarketSpec(1, "A", 1, 1, 1, 1, "inactive", False, 0.1).tradable
     assert not MarketSpec(1, "A", 1, 1, 1, 1, "active", True, 0.1).tradable
+
+
+def test_flatten_closes_every_position_reduce_only_with_slippage_cap():
+    import asyncio
+    from src.trader import AccountSnapshot, Position
+
+    xau = MarketSpec(92, "XAU", 4, 2, 0.0015, 10.0, "active", False, 0.0666)
+    eur = MarketSpec(96, "EURUSD", 1, 5, 5.0, 10.0, "active", False, 0.05)
+    cfg = SimpleNamespace(account_index="1", api_key_index="4", quota_reserve=100, max_paid_tx_per_min=10,
+                          dry_run=False, api_key_private_key="k")
+    t = Trader(cfg)
+    t.specs = {92: xau, 96: eur}
+    positions = {92: Position(0.0018, 7.5, 0), 96: Position(-17.6, -20.0, 0)}
+    sent = []
+
+    class Client:
+        async def create_market_order(self, **kw):
+            sent.append(kw)
+            positions.pop(kw["market_index"], None)   # exchange fills it
+            return None, SimpleNamespace(code=200, volume_quota_remaining=500), None
+
+    async def snap():
+        return AccountSnapshot(100, 90, dict(positions), 0)
+
+    async def get(path, params):
+        return {"bids": [{"price": "4000.00"}], "asks": [{"price": "4000.10"}]} if params["market_id"] == "92" \
+            else {"bids": [{"price": "1.13400"}], "asks": [{"price": "1.13410"}]}
+
+    t._client, t.account_snapshot, t._get = Client(), snap, get
+    assert asyncio.run(t.flatten_all_positions((100,))) is True
+    by_m = {k["market_index"]: k for k in sent}
+    assert by_m[92]["is_ask"] is True and by_m[92]["reduce_only"] is True and by_m[92]["base_amount"] == 18
+    assert by_m[92]["avg_execution_price"] == 396000          # 4000.00 * 0.99, sell
+    assert by_m[96]["is_ask"] is False and by_m[96]["base_amount"] == 176
+    assert by_m[96]["avg_execution_price"] == 114545          # ceil(1.13410 * 1.01 * 1e5), buy
+
+
+def test_flatten_reports_leftovers():
+    import asyncio
+    from src.trader import AccountSnapshot, Position
+
+    xau = MarketSpec(92, "XAU", 4, 2, 0.0015, 10.0, "active", False, 0.0666)
+    cfg = SimpleNamespace(account_index="1", api_key_index="4", quota_reserve=100, max_paid_tx_per_min=10,
+                          dry_run=False, api_key_private_key="k")
+    t = Trader(cfg)
+    t.specs = {92: xau}
+
+    class Client:
+        async def create_market_order(self, **kw):   # never fills (e.g. book too thin within cap)
+            return None, SimpleNamespace(code=200, volume_quota_remaining=500), None
+
+    async def snap():
+        return AccountSnapshot(100, 90, {92: Position(0.0018, 7.5, 0)}, 0)
+
+    async def get(path, params):
+        return {"bids": [{"price": "4000.00"}], "asks": [{"price": "4000.10"}]}
+
+    async def no_sleep(_):
+        return None
+    t._client, t.account_snapshot, t._get = Client(), snap, get
+    orig = asyncio.sleep
+    asyncio.sleep = no_sleep
+    try:
+        assert asyncio.run(t.flatten_all_positions((100, 300))) is False
+    finally:
+        asyncio.sleep = orig

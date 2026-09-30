@@ -73,7 +73,11 @@ quota burn; 3–5 markets is the sweet spot at this size.
 - Dead man's switch: Lighter scheduled cancel-all 330s out, refreshed every 60s (Lighter's
   minimum is 300s). Process dies / laptop sleeps → all orders gone within ~5–6 min.
 - Stop (`touch data/STOP`, `pkill -f run_mm.py`, Ctrl-C), daily-loss halt, and tx-error halt
-  all cancel the bot's orders and only disarm the switch once the cancel is confirmed.
+  all cancel the bot's orders, then **close every position on the account** with reduce-only
+  market orders (worst price 1%, then 3% from the touch) so it ends holding only USDC
+  (`FLATTEN_ON_STOP=true`). The switch is disarmed only once the cancel is confirmed.
+  A hard kill (`kill -9`), crash of the machine, or sleep skips this — the dead man's switch then
+  cancels orders but positions stay open.
 - Feed silent > 10s, or account data stale > 30s → all quotes pulled until healthy.
 - Any exception in one market pulls that market's quotes; others keep running.
 - `lighter-sdk` pinned to 1.1.5 (signer verified byte-identical to the official repo).
@@ -84,7 +88,7 @@ quota burn; 3–5 markets is the sweet spot at this size.
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 cp .env.example .env                               # fill in account index + API key
 .venv/bin/python tools/rank_markets.py             # pick MARKETS (Mondays)
-.venv/bin/pytest -q tests                          # 43 offline tests
+.venv/bin/pytest -q tests                          # 50 offline tests
 DRY_RUN=true .venv/bin/python run_mm.py            # live data, paper orders — Ctrl-C to stop
 nohup .venv/bin/python -u run_mm.py >> data/mm_live.log 2>&1 &   # live (DRY_RUN=false in .env)
 tail -f data/mm_live.log                           # watch; HEARTBEAT line every 5 min
