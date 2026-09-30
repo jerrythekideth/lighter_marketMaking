@@ -6,3 +6,5 @@ venv/
 data/*.csv
 .DS_Store
 data/*.log
+data/state.json
+data/STOP

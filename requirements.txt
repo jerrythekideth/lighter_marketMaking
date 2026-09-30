@@ -1,3 +1,10 @@
 python-dotenv>=1.0
 requests>=2.31
-lighter-sdk
+aiohttp>=3.9
+websockets>=13
+# Pinned: the signer is a compiled binary and Lighter has shipped API changes that broke
+# older SDKs (e.g. error 21136). 1.1.5 was verified byte-identical to github.com/elliottech/
+# lighter-python on 2026-09-29. Upgrade deliberately, re-run tests + a dry run first.
+lighter-sdk==1.1.5
+# dev
+pytest>=8

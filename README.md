@@ -1,117 +1,111 @@
 # lighter_marketMaking
 
-Market-making bot + points-farming tracker for [Lighter](https://lighter.xyz) (zkLighter perps DEX).
-Goal: run resting two-sided quotes on Lighter to earn Season 2 points (retail volume +
-market-maker liquidity points), while measuring real cost-per-point so we know whether
-it's actually worth running past the test phase.
+Market-making bot for [Lighter](https://lighter.xyz) (zkLighter perps DEX), built to earn the
+**Liquidity Partner Program** rewards: a weekly LIT pool (~25,000 LIT/week in Sept 2026) paid to
+Premium accounts for resting orders near the top of the book.
 
-**Status: Phase 0 (market-data monitoring only). No live orders are placed yet.**
+## What the program pays for (verified 2026-09-29)
 
-## Why this shape
+From [docs.lighter.xyz/liquidity-partner-program](https://docs.lighter.xyz/liquidity-partner-program)
+and its [public spreadsheet](https://docs.google.com/spreadsheets/d/1_Jr4C94Q-F2DsVar_Tmc15SBGLc-lSVCjwgkQ6f_3po):
 
-Full research writeup is in the conversation history; the short version:
+- Order-book snapshots ~every minute at random. Rewards per snapshot scale with your resting
+  size × a multiplier that **decays exponentially with distance from the best bid/offer** ×
+  a volatility multiplier. Half the pool goes to bids, half to asks.
+- One global weekly pool split across ~30 markets by weight. New weights every **Monday 17:00
+  UTC**; results + LIT payouts every Monday.
+- Premium account required. (Points Season 2 — what this repo originally targeted — **ended
+  2025-12-26**.)
+- Thin markets pay as much as deep ones. ANTHROPIC/OPENAI paid 971 LIT/week each with only
+  ~$400–700 of competing liquidity within 2bps of mid, vs. ~$860k on US100 for 1,214 LIT.
+  `tools/rank_markets.py` shows this every week.
 
-- Lighter's public REST API (`https://mainnet.zklighter.elliot.ai/api/v1/...`) exposes order
-  books, depth, and fees **with no auth**. Placing orders needs an API key derived from the
-  account's L1 key, generated via the SDK.
-- Market-maker points (20% of the weekly 250k pool) are scored from **hourly random order-book
-  sampling**: depth at $10k/$30k/$100k/$300k and spread bands at 1/2/5/10 bps from mid, bid and
-  ask scored separately. Weekly maker volume also scores directly:
-  `score = volume + max(0, (volume - 2.5B) * 0.25)`.
-- Only **Premium accounts** earn MM points, and Premium accounts pay fees (0.004% maker /
-  0.028% taker base, discounted by staking LIT or buying fee credits).
-- Live top-of-book on majors/RWA pairs (BTC, gold, TSLA, NVDA, WTI, EURUSD) is already sub-1-3
-  bps, held by a handful of clearly systematic accounts. We will not win the spread there — the
-  realistic edge is resting **depth in the 5-10bps / $100k+ bands**, which the scoring explicitly
-  rewards and which is less contested.
-- Season 2's points → $ conversion rate is **not published**. Treat every dollar spent on fees
-  as a real cost against an unconfirmed payoff. This is a paid experiment, not a known-profitable
-  strategy.
+## How the bot trades
 
-## Repo layout
+`run_mm.py`, every second:
 
-```
-src/
-  config.py          # loads .env, holds all tunables in one place
-  market_data.py      # public, no-auth: order book snapshots, spread/depth calc
-  points_tracker.py   # CSV log of volume/fees vs. points -> $/point over time
-  strategy.py          # quote generation (bands, position/loss limits, circuit breaker)
-  trader.py            # SignerClient wrapper — STUBBED, see "Order placement" below
-run_monitor.py         # safe to run right now, no API keys needed
-run_mm.py               # the actual bot loop — DRY_RUN=true by default
-data/                   # gitignored — csv logs land here
-.env.example            # template; copy to .env and fill in real values
-```
+1. **Account-wide checks** — STOP file, daily loss limit (per UTC day, persisted in
+   `data/state.json` so restarts don't reset it), consecutive tx errors, market-data feed
+   health, gross exposure, free margin, systemic breaker (3+ markets tripping at once).
+2. **Per market** — quotes are pulled if any of these say no: market not active / force-reduce-
+   only · session blackout (`src/sessions.py`) · book too wide or mid far from mark price ·
+   volatility breaker (mid moved > max(40bps, 2× hourly vol) in 30s → out for 5 min).
+3. **Quote** — join the best bid/ask (step one tick inside when the spread ≥ 10bps), but no
+   closer to mid than max(1bp, 0.1 × hourly vol), shifted against inventory (skew). Position cap
+   per market: the side that would breach it stops quoting.
+4. **Reconcile** with the bot's resting orders using modify (1 tx) instead of cancel+place.
 
-## Setup
+All orders are post-only (never pay taker fees). The bot only ever touches orders it tagged
+itself (`client_order_index ≥ 2^47`); orders you place in the UI are left alone — except by the
+dead man's switch, which is account-wide.
+
+### Trading hours and event risk (`src/sessions.py`)
+
+Lighter lists stocks/FX/commodities 24/7, but prices them off their own book while the real
+market is closed, then snaps to the oracle at the reopen. Three weeks of Lighter candles showed
+where the jumps are, so the bot pulls quotes in those windows and goes **reduce-only for 10
+minutes before each one** (no new inventory into the event):
+
+| class | blackout windows (US Eastern) |
+|---|---|
+| all | weekdays 08:28–08:40 (CPI/NFP/claims), FOMC decision days 13:58–14:30 |
+| US stocks/indices | 03:55–04:10, 09:25–09:45, 15:58–16:05, 19:55–20:10 (Sun–Thu) |
+| CME metals/energy | 16:58–18:05 daily, Sun 17:55–18:10 |
+| Brent | 17:58–20:05 daily, Sun 19:55–20:10 |
+| FX | 16:58–17:05 daily, Sun 16:55–17:10 |
+| crypto, pre-IPO | only the "all" windows |
+
+RWA weekends are the *quiet* part (median hourly move ~1/3 of weekdays); the danger is the
+reopen, which the windows cover. Markets not listed in `sessions.py` are refused. FOMC dates are
+hardcoded through 2027 — add 2028 when the Fed publishes them.
+
+### Volume quota — the real constraint for a small account
+
+Premium accounts spend 1 "volume quota" per order create/modify (cancels are free), get one free
+tx every 15s, and earn 1 quota per $2 traded. The bot reads the remaining quota from every
+response (`HEARTBEAT ... quota=`), caps paid updates at `MAX_PAID_TX_PER_MIN`, and below
+`QUOTA_RESERVE` drops to the free slot only. When it can't afford to move an order that the
+market has moved against, it cancels it (free) instead. More markets = more updates = faster
+quota burn; 3–5 markets is the sweet spot at this size.
+
+### Safety nets
+
+- Dead man's switch: Lighter scheduled cancel-all 330s out, refreshed every 60s (Lighter's
+  minimum is 300s). Process dies / laptop sleeps → all orders gone within ~5–6 min.
+- Stop (`touch data/STOP`, `pkill -f run_mm.py`, Ctrl-C), daily-loss halt, and tx-error halt
+  all cancel the bot's orders and only disarm the switch once the cancel is confirmed.
+- Feed silent > 10s, or account data stale > 30s → all quotes pulled until healthy.
+- Any exception in one market pulls that market's quotes; others keep running.
+- `lighter-sdk` pinned to 1.1.5 (signer verified byte-identical to the official repo).
+
+## Run it
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env   # then fill in real values, .env is gitignored
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+cp .env.example .env                               # fill in account index + API key
+.venv/bin/python tools/rank_markets.py             # pick MARKETS (Mondays)
+.venv/bin/pytest -q tests                          # 43 offline tests
+DRY_RUN=true .venv/bin/python run_mm.py            # live data, paper orders — Ctrl-C to stop
+nohup .venv/bin/python -u run_mm.py >> data/mm_live.log 2>&1 &   # live (DRY_RUN=false in .env)
+tail -f data/mm_live.log                           # watch; HEARTBEAT line every 5 min
+touch data/STOP                                    # graceful stop (delete the file to restart)
 ```
 
-## Phase plan
+Weekly: check your address in the "Rewards …" tab of the spreadsheet on Mondays and compare
+LIT earned × LIT price against the week's trading PnL. That number decides whether to scale up.
 
-**Phase 0 — Monitor only (now, no keys needed)**
-Run `python run_monitor.py`. It polls public order books for the configured markets every
-N seconds, logs spread (bps), depth at each threshold, and top-of-book account indices to
-`data/market_snapshots.csv`. Purpose: confirm which markets/bands are actually winnable
-before risking a cent, and build a baseline of "normal" spread so the bot can tell when it's
-about to quote into a moving market.
+## Layout
 
-**Phase 1 — Testnet, dry-run**
-Once keys exist: point `LIGHTER_BASE_URL` at `https://testnet.zklighter.elliot.ai`, keep
-`DRY_RUN=true`. `run_mm.py` computes what it *would* quote (price, size, bands) from
-`strategy.py` and logs it, but the order-placement calls in `trader.py` are not implemented
-yet — see below. This phase is about validating the quoting logic and risk limits against
-real testnet book data before any code can touch funds.
-
-**Phase 2 — Mainnet, tiny size, still capped**
-Flip to mainnet base URL, small `MAX_POSITION_USD` / `MAX_ORDER_USD`, `DRY_RUN=false`.
-Run for a few days, pull `data/points_log.csv` after each Friday distribution, compute
-$/point, decide whether to scale or stop. Do not skip Phase 0/1.
-
-## Order placement — needs verification before Phase 1
-
-`src/trader.py` has the wiring (config, position tracking, safety checks) but the actual
-`SignerClient.create_order(...)` / `cancel_order(...)` calls are left as `NotImplementedError`
-with the exact shape to fill in. Reason: I don't have a verified, current method signature for
-Lighter's Python SDK order calls, and guessing at that with real funds is how you send a
-malformed order or fat-finger a size. Before Phase 1:
-
-1. `pip install lighter-sdk` (or `pip install git+https://github.com/elliottech/zklighter-perps-python.git`)
-2. Read `examples/system_setup.py` and the order-placement examples in that SDK repo directly.
-3. Fill in the two methods in `trader.py`, test on testnet with `DRY_RUN=true` first (it'll log
-   the exact call it would make without sending it), then `DRY_RUN=false` on testnet only.
-
-## Safety limits (config.py / .env)
-
-- `MAX_POSITION_USD` — hard cap on net exposure per market
-- `MAX_ORDER_USD` — cap on a single resting order
-- `DAILY_LOSS_LIMIT_USD` — bot halts and cancels all orders if breached
-- `DRY_RUN` — when true, no order-placing call is ever made, only logged
-- `MARKETS` — comma-separated symbols to quote (start with 1-2, e.g. `XAU,EURUSD`)
-
-## Points economics worksheet
-
-Track these every week in `data/points_log.csv` (`run_monitor.py`/manual entry, whichever
-the dashboard allows):
-
-| metric | source |
-|---|---|
-| maker volume ($) | your account / Lighter UI |
-| fees paid ($) | your account / Lighter UI |
-| MM points earned | Lighter points dashboard |
-| retail/volume points earned | Lighter points dashboard |
-| implied $/point | fees_paid / total_points (lower bound, ignores adverse fills) |
-
-Stop-loss rule: if measured $/point stays above what you're willing to pay for an unconfirmed
-token conversion, stop — don't extrapolate from Season 1's ~$40-140/point, Season 2's rate is
-unknown.
+```
+src/config.py     all tunables (.env)          src/feed.py      websocket market data
+src/sessions.py   trading hours / blackouts     src/risk.py      loss limit, breakers, book checks
+src/strategy.py   quote math (pure)             src/trader.py    SDK wrapper, quota budget, reads
+run_mm.py         the bot                       tools/rank_markets.py  weekly market ranking
+run_monitor.py    old read-only depth monitor   tests/           offline tests (fake exchange)
+```
 
 ## Disclaimer
 
-This is experimental. Real funds, real fees, no guaranteed points value, no guaranteed token
-conversion. Start on testnet, then mainnet with the smallest size that still tells you
-something.
+Real funds. Rewards are paid in LIT at Lighter's discretion and the pool size changes weekly.
+Thin markets that pay the most are also the most volatile, and new listings can gap (Feb 2026:
+an $8.2M loss on the ARC market triggered auto-deleveraging). Keep size small.
