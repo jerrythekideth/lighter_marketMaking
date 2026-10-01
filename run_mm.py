@@ -55,7 +55,7 @@ ACCOUNT_STALE_SECONDS = 30
 RECENT_TX_SECONDS = 5
 # Wall-clock gap between loop steps that means the machine slept or the process stalled.
 # (macOS's monotonic clock stops during sleep, so monotonic-based staleness can't see it.)
-WAKE_GAP_SECONDS = 20
+WAKE_GAP_SECONDS = 60  # real sleeps are minutes; slow networks can stall a step ~20-30s
 # An unexpected error in a loop step is logged and retried; only this long of nothing but
 # failures (e.g. network gone) halts the bot.
 MAX_FAILING_SECONDS = 300
