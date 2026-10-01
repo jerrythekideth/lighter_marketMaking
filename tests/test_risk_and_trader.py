@@ -156,3 +156,63 @@ def test_flatten_reports_leftovers():
         assert asyncio.run(t.flatten_all_positions((100, 300))) is False
     finally:
         asyncio.sleep = orig
+
+
+def _live_trader():
+    cfg = SimpleNamespace(account_index="1", api_key_index="4", quota_reserve=100, max_paid_tx_per_min=10,
+                          dry_run=False, api_key_private_key="k", base_url="https://x")
+    return Trader(cfg)
+
+
+def test_auth_token_age_uses_wall_clock():
+    # 2026-10-01: monotonic clock stopped during laptop sleep -> expired token reused -> 401s.
+    t = _live_trader()
+    minted = []
+
+    class Client:
+        def create_auth_token_with_expiry(self, api_key_index):
+            minted.append(1)
+            return f"tok{len(minted)}", None
+    t._client = Client()
+    assert t._auth() == {"Authorization": "tok1"}
+    assert t._auth() == {"Authorization": "tok1"}          # cached
+    t._token_at -= 20 * 60                                  # 20 real minutes passed (e.g. asleep)
+    assert t._auth() == {"Authorization": "tok2"}
+
+
+def test_get_retries_once_on_401_with_fresh_token():
+    import asyncio
+    t = _live_trader()
+    seen = []
+
+    class Client:
+        def create_auth_token_with_expiry(self, api_key_index):
+            return f"tok{len(seen)}", None
+
+    class Resp:
+        def __init__(self, status): self.status = status
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        def raise_for_status(self):
+            if self.status >= 400: raise RuntimeError(self.status)
+        async def json(self, content_type=None): return {"code": 200, "ok": True}
+
+    class Http:
+        def get(self, url, params, headers):
+            seen.append(headers["Authorization"])
+            return Resp(401 if len(seen) == 1 else 200)
+    t._client, t._http = Client(), Http()
+    assert asyncio.run(t._get("/x", {}))["ok"]
+    assert len(seen) == 2 and seen[0] != seen[1]
+
+
+def test_tx_timeout_returns_error_instead_of_hanging(monkeypatch):
+    import asyncio
+    import src.trader as tr
+    monkeypatch.setattr(tr, "TX_TIMEOUT_S", 0.05)
+    t = _live_trader()
+
+    async def hang():
+        await asyncio.sleep(10)
+    _, resp, err = asyncio.run(t._tx(hang()))
+    assert resp is None and "Timeout" in err

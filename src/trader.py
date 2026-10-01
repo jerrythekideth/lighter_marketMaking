@@ -34,6 +34,9 @@ log = logging.getLogger("trader")
 
 BOT_COI_MIN = 2 ** 47  # Lighter caps client_order_index at 2^48 - 1
 AUTH_TOKEN_TTL_S = 8 * 60  # tokens are signed for 10 min; refresh well before
+# Every SDK transaction call gets a hard timeout: the SDK's HTTP client has none, and after
+# a laptop sleep a half-dead connection hung a cancel for 15 minutes (2026-10-01).
+TX_TIMEOUT_S = 20
 
 
 @dataclass(frozen=True)
@@ -171,15 +174,20 @@ class Trader:
     def _auth(self) -> dict:
         if self._client is None:
             return {}
-        if self._token is None or time.monotonic() - self._token_at > AUTH_TOKEN_TTL_S:
+        # Wall clock on purpose: macOS's monotonic clock stops during sleep, which made the bot
+        # keep a token that had expired in real time (401s after waking, 2026-10-01).
+        if self._token is None or abs(time.time() - self._token_at) > AUTH_TOKEN_TTL_S:
             token, err = self._client.create_auth_token_with_expiry(api_key_index=self.key_index)
             if err:
                 raise RuntimeError(f"auth token: {err}")
-            self._token, self._token_at = token, time.monotonic()
+            self._token, self._token_at = token, time.time()
         return {"Authorization": self._token}
 
-    async def _get(self, path: str, params: dict) -> dict:
+    async def _get(self, path: str, params: dict, _retry: bool = True) -> dict:
         async with self._http.get(f"{self.cfg.base_url}{path}", params=params, headers=self._auth()) as r:
+            if r.status == 401 and _retry and self._client is not None:
+                self._token = None  # stale/expired token: mint a new one and try once more
+                return await self._get(path, params, _retry=False)
             if r.status in (429, 405):
                 raise RuntimeError(f"rate limited ({r.status}) on {path}")
             r.raise_for_status()
@@ -291,6 +299,14 @@ class Trader:
         self._seq = (self._seq + 1) % 10
         return BOT_COI_MIN + int(time.time() * 1000) * 10 + self._seq
 
+    async def _tx(self, coro):
+        """Run an SDK tx call with a hard timeout; a timeout comes back as an error result
+        (counted by the consecutive-error halt) instead of hanging the loop."""
+        try:
+            return await asyncio.wait_for(coro, TX_TIMEOUT_S)
+        except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
+            return None, None, f"{type(e).__name__}: {e}"
+
     def _tx_result(self, what: str, resp, err) -> bool:
         if _ok(resp, err):
             self.consecutive_tx_errors = 0
@@ -311,7 +327,7 @@ class Trader:
             self.budget.record(None)
             log.info("[DRY_RUN] place %s %s %s @ %s ($%.2f)", symbol, side, base, px, base * px)
             return expected
-        _, resp, err = await self._client.create_order(
+        _, resp, err = await self._tx(self._client.create_order(
             market_index=market_id,
             client_order_index=coi,
             base_amount=base_int,
@@ -320,7 +336,7 @@ class Trader:
             order_type=lighter.SignerClient.ORDER_TYPE_LIMIT,
             time_in_force=lighter.SignerClient.ORDER_TIME_IN_FORCE_POST_ONLY,
             reduce_only=False,
-        )
+        ))
         self.budget.record(resp)
         if self._tx_result(f"place {symbol} {side}", resp, err):
             log.info("placed %s %s %s @ %s ($%.2f)", symbol, side, base, px, base * px)
@@ -338,12 +354,12 @@ class Trader:
             self.budget.record(None)
             log.info("[DRY_RUN] modify %s %s %s -> %s", symbol, side, order.price, px)
             return True
-        _, resp, err = await self._client.modify_order(
+        _, resp, err = await self._tx(self._client.modify_order(
             market_index=order.market_id,
             order_index=order.client_order_index,
             base_amount=base_int,
             price=price_int,
-        )
+        ))
         self.budget.record(resp)
         if self._tx_result(f"modify {symbol} {side}", resp, err):
             log.info("moved %s %s %s -> %s", symbol, side, order.price, px)
@@ -356,9 +372,9 @@ class Trader:
             self._paper.pop(order.client_order_index, None)
             log.info("[DRY_RUN] cancel %s %s @ %s %s", symbol, side, order.price, why)
             return True
-        _, resp, err = await self._client.cancel_order(
+        _, resp, err = await self._tx(self._client.cancel_order(
             market_index=order.market_id, order_index=order.client_order_index,
-        )
+        ))
         if self._tx_result(f"cancel {symbol} {side}", resp, err):
             log.info("cancelled %s %s @ %s %s", symbol, side, order.price, why)
             return True
@@ -374,9 +390,9 @@ class Trader:
         if self.cfg.dry_run:
             return True
         ts_ms = int((time.time() + seconds) * 1000)
-        _, resp, err = await self._client.cancel_all_orders(
+        _, resp, err = await self._tx(self._client.cancel_all_orders(
             time_in_force=lighter.SignerClient.CANCEL_ALL_TIF_SCHEDULED, timestamp_ms=ts_ms,
-        )
+        ))
         if not _ok(resp, err):
             log.error("arming dead man's switch failed: %s", err or resp)
             return False
@@ -385,9 +401,9 @@ class Trader:
     async def disarm_dead_mans_switch(self) -> None:
         if self.cfg.dry_run:
             return
-        _, resp, err = await self._client.cancel_all_orders(
+        _, resp, err = await self._tx(self._client.cancel_all_orders(
             time_in_force=lighter.SignerClient.CANCEL_ALL_TIF_ABORT, timestamp_ms=0,
-        )
+        ))
         if not _ok(resp, err):
             log.error("disarming dead man's switch failed: %s", err or resp)
         else:
@@ -438,18 +454,32 @@ class Trader:
         worst = best * (1 - slippage_bps / 1e4) if is_ask else best * (1 + slippage_bps / 1e4)
         price_int = self.to_price_int(market_id, worst, is_ask=not is_ask)  # round toward the book
         base_int = round(abs(pos.size) * 10 ** spec.size_decimals)
-        _, resp, err = await self._client.create_market_order(
+        _, resp, err = await self._tx(self._client.create_market_order(
             market_index=market_id,
             client_order_index=self._next_coi(),
             base_amount=base_int,
             avg_execution_price=price_int,
             is_ask=is_ask,
             reduce_only=True,
-        )
+        ))
         self.budget.record(resp)
         if self._tx_result(f"close {spec.symbol}", resp, err):
             log.info("closing %s %+g ($%.2f) at market, worst price %s (%.0fbps)",
                      spec.symbol, pos.size, pos.value_usd, price_int / 10 ** spec.price_decimals, slippage_bps)
+
+    async def cancel_everything_now(self) -> bool:
+        """Account-wide immediate cancel-all (also hits manual orders). Shutdown fallback for
+        when listing our orders fails, since it needs no read first."""
+        if self.cfg.dry_run:
+            return True
+        _, resp, err = await self._tx(self._client.cancel_all_orders(
+            time_in_force=lighter.SignerClient.CANCEL_ALL_TIF_IMMEDIATE, timestamp_ms=0,
+        ))
+        if not _ok(resp, err):
+            log.error("immediate cancel-all failed: %s", err or resp)
+            return False
+        log.info("sent account-wide cancel-all")
+        return True
 
     async def cancel_all_bot_orders(self, why: str) -> bool:
         """Cancel every bot order in every market; True if confirmed none remain."""

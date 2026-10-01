@@ -56,6 +56,9 @@ RECENT_TX_SECONDS = 5
 # Wall-clock gap between loop steps that means the machine slept or the process stalled.
 # (macOS's monotonic clock stops during sleep, so monotonic-based staleness can't see it.)
 WAKE_GAP_SECONDS = 20
+# An unexpected error in a loop step is logged and retried; only this long of nothing but
+# failures (e.g. network gone) halts the bot.
+MAX_FAILING_SECONDS = 300
 
 
 class Bot:
@@ -286,10 +289,28 @@ class Bot:
             feed_task.cancel()
 
     async def _loop(self) -> None:
+        failing_since = None
         while True:
             await asyncio.sleep(self.cfg.loop_seconds)
-            if not await self.step():
-                return
+            try:
+                if not await self.step():
+                    return
+                failing_since = None
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                now = time.time()
+                failing_since = failing_since or now
+                log.exception("loop step failed (failing for %.0fs) — pulling quotes and retrying",
+                              now - failing_since)
+                try:
+                    await self._pull_all("loop error")
+                except Exception as e:
+                    log.warning("pull after error failed: %s", e)
+                if now - failing_since > MAX_FAILING_SECONDS:
+                    log.error("failing for over %ds — halting", MAX_FAILING_SECONDS)
+                    return
+                await asyncio.sleep(5)
 
     async def step(self) -> bool:
         """One loop iteration. Returns False when the bot should shut down."""
@@ -416,19 +437,28 @@ async def main() -> None:
             log.info("shutting down — cancelling bot orders")
             try:
                 clear = await trader.cancel_all_bot_orders("(shutdown)")
-            except Exception:
+            except Exception as e:
+                log.warning("cancel on shutdown failed (%s) — falling back to account-wide cancel-all", e)
                 clear = False
-                log.exception("cancel on shutdown failed")
+                if await trader.cancel_everything_now():
+                    await asyncio.sleep(1.5)
+                    try:
+                        clear = not any(await trader.bot_orders())
+                    except Exception:
+                        clear = False
             flat = True
             if CONFIG.flatten_on_stop:
                 log.info("closing all positions so the account holds only USDC")
-                try:
-                    flat = await trader.flatten_all_positions()
-                except Exception:
-                    flat = False
-                    log.exception("flatten on shutdown failed — check positions in the Lighter UI")
-                if flat:
-                    log.info("all positions closed")
+                flat = False
+                for attempt in range(1, 4):
+                    try:
+                        flat = await trader.flatten_all_positions()
+                        break
+                    except Exception as e:
+                        log.warning("flatten attempt %d failed: %s", attempt, e)
+                        await asyncio.sleep(5)
+                log.info("all positions closed") if flat else \
+                    log.error("positions may still be open — check the Lighter UI")
             # Only drop the safety net once we've confirmed our orders are gone.
             if clear:
                 await trader.disarm_dead_mans_switch()

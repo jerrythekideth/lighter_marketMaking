@@ -279,3 +279,32 @@ def test_status_logs_on_kind_change_only(bot, caplog):
     msgs = [r.getMessage() for r in caplog.records]
     assert msgs == ["SOL -> WAIT (mid 306bps from mark)", "SOL -> QUOTING"]
     assert bot.status[SOL.market_id] == "QUOTING"
+
+
+def test_loop_survives_step_exception_then_halts_after_sustained_failure(bot, monkeypatch):
+    calls = {"n": 0}
+
+    async def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("Operation timed out")        # transient: must not kill the bot
+        return False                                      # then a normal stop
+    bot.step = flaky
+    monkeypatch.setattr(run_mm.asyncio, "sleep", _no_sleep)
+    run(bot._loop())
+    assert calls["n"] == 2
+
+    calls["n"] = 0
+
+    async def always_fail():
+        calls["n"] += 1
+        raise OSError("down")
+    bot.step = always_fail
+    t0 = [1000.0]
+    monkeypatch.setattr(run_mm.time, "time", lambda: t0.__setitem__(0, t0[0] + 100) or t0[0])
+    run(bot._loop())                                      # returns (halts) instead of looping forever
+    assert 3 <= calls["n"] <= 5
+
+
+async def _no_sleep(_):
+    return None
