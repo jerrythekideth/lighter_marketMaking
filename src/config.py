@@ -105,6 +105,10 @@ class Config:
     # is killed hard (kill -9) or the machine sleeps — the dead man's switch only cancels orders.
     flatten_on_stop: bool = field(default_factory=lambda: _bool("FLATTEN_ON_STOP", True))
 
+    # Only open new risk in markets on the current week's Liquidity Partner reward list (re-read
+    # every 3h; weights change Mondays 17:00 UTC). A market that drops off goes reduce-only.
+    require_rewarded: bool = field(default_factory=lambda: _bool("REQUIRE_REWARDED", True))
+
     # --- pacing / quota ---
     loop_seconds: float = field(default_factory=lambda: _float("LOOP_SECONDS", 1.0))
     account_refresh_s: float = field(default_factory=lambda: _float("ACCOUNT_REFRESH_S", 3.0))

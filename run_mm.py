@@ -33,6 +33,7 @@ import time
 
 from src.config import CONFIG
 from src.feed import MarketFeed
+from src.rewards import current_week
 from src.risk import DailyLoss, MarketGuard, book_problem, recent_trips
 from src.sessions import ASSET_CLASS, BLACKOUT, REDUCE_ONLY, session_state
 from src.strategy import compute_quote, half_edge_bps, is_dangerous, needs_requote, sides_allowed
@@ -54,6 +55,7 @@ DMS_FORCE_SECONDS = 210
 SPECS_REFRESH_SECONDS = 300
 VOL_REFRESH_SECONDS = 3600
 HEARTBEAT_SECONDS = 300
+REWARDS_REFRESH_SECONDS = 3 * 3600
 ACCOUNT_STALE_SECONDS = 30
 # How long a just-sent place/cancel is trusted over a refresh that may predate it.
 RECENT_TX_SECONDS = 5
@@ -87,6 +89,8 @@ class Bot:
         self._recent_placed: dict[int, tuple[float, BotOrder]] = {}
         self._recent_cancelled: dict[int, float] = {}
         self._last_wall = time.time()
+        self.reward_week: str | None = None
+        self.rewarded: set[str] | None = None  # None = never fetched -> don't restrict
 
     # --- small helpers ---
 
@@ -126,6 +130,20 @@ class Bot:
             except Exception as e:
                 log.warning("vol refresh %s failed: %s", symbol, e)
         log.info("1h vol (bps): %s", {s: round(self.vols.get(m) or 0, 1) for s, m in self.active})
+
+    async def _refresh_rewards(self) -> None:
+        try:
+            week, table = await asyncio.to_thread(current_week)
+        except Exception as e:
+            log.warning("reward list refresh failed (keeping %s): %s", self.reward_week or "no list", e)
+            return
+        if week != self.reward_week:
+            log.info("LP reward week %s: %s", week,
+                     {s: round(table.get(s, 0)) for s, _ in self.active})
+        self.reward_week, self.rewarded = week, set(table)
+        missing = [s for s, _ in self.active if s not in self.rewarded]
+        if missing and self.cfg.require_rewarded:
+            log.warning("not in this week's reward list (reduce-only): %s", missing)
 
     async def _refresh_account(self) -> None:
         try:
@@ -240,7 +258,10 @@ class Bot:
             return await self._pull_market(symbol, m, "(breaker)")
 
         pos = self.acct.position(m).value_usd
-        reduce_reason = why if sess == REDUCE_ONLY else global_reduce
+        unrewarded = (self.cfg.require_rewarded and self.rewarded is not None and symbol not in self.rewarded)
+        reduce_reason = (why if sess == REDUCE_ONLY
+                         else f"not in LP rewards {self.reward_week}" if unrewarded
+                         else global_reduce)
         p = lambda name: self.cfg.for_market(symbol, name)  # per-market override or global
         order_usd, max_pos = p("max_order_usd"), p("max_position_usd")
         edge = half_edge_bps(vol, p("min_edge_bps"), p("edge_vol_mult"))
@@ -282,7 +303,9 @@ class Bot:
         feed_task = asyncio.create_task(self.feed.run())
         try:
             await self._refresh_vols()
+            await self._refresh_rewards()
             self._timers["vols"] = self._timers["specs"] = self._timers["heartbeat"] = time.monotonic()
+            self._timers["rewards"] = time.monotonic()
             # Give the feed a moment to deliver snapshots before the first decisions.
             for _ in range(20):
                 if self.feed.healthy(self.cfg.feed_max_silence_s):
@@ -344,6 +367,8 @@ class Bot:
                 log.warning("specs refresh failed: %s", e)
         if self._due("vols", VOL_REFRESH_SECONDS):
             await self._refresh_vols()
+        if self._due("rewards", REWARDS_REFRESH_SECONDS):
+            await self._refresh_rewards()
         if self._due("account", self.cfg.account_refresh_s):
             await self._refresh_account()
 

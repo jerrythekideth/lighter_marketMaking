@@ -15,12 +15,9 @@ max leverage, and whether src/sessions.py knows the market's trading hours.
 `LIT/$comp` = weekly LIT per $1k of competing near-top liquidity: higher = more reward per
 dollar quoted. It's a crude proxy — Lighter doesn't publish per-asset caps or the decay rate.
 """
-import csv
-import io
 import json
 import math
 import os
-import re
 import statistics
 import sys
 import time
@@ -28,24 +25,10 @@ import time
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from src.rewards import current_week  # noqa: E402
 from src.sessions import ASSET_CLASS  # noqa: E402
 
 BASE = "https://mainnet.zklighter.elliot.ai"
-SHEET = "1_Jr4C94Q-F2DsVar_Tmc15SBGLc-lSVCjwgkQ6f_3po"
-ALIASES = {"BRENT": "BRENTOIL"}
-
-
-def weekly_rewards() -> tuple[str, dict[str, float]]:
-    html = requests.get(f"https://docs.google.com/spreadsheets/d/{SHEET}/htmlview", timeout=20).text
-    tabs = re.findall(r'\{name: "([^"]+)", pageUrl: "[^"]*", gid: "(\d+)"', html)
-    name, gid = next((n, g) for n, g in tabs if not n.startswith("Rewards"))
-    text = requests.get(f"https://docs.google.com/spreadsheets/d/{SHEET}/export?format=csv&gid={gid}", timeout=20).text
-    out = {}
-    for row in csv.DictReader(io.StringIO(text)):
-        sym = (row.get("Symbol") or "").strip()
-        if sym:
-            out[ALIASES.get(sym, sym)] = float(row["LIT Reward"].replace(",", ""))
-    return name, out
 
 
 def vol_1h_bps(market_id: int) -> float:
@@ -59,7 +42,7 @@ def vol_1h_bps(market_id: int) -> float:
 
 
 def main() -> None:
-    week, rewards = weekly_rewards()
+    week, rewards = current_week()
     details = {m["symbol"]: m for m in requests.get(f"{BASE}/api/v1/orderBookDetails", timeout=20)
                .json()["order_book_details"]}
     lit_px = None

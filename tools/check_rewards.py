@@ -11,15 +11,14 @@ Monday 17:00 UTC to Monday 17:00 UTC). Addresses are shown shortened: 0xAbCd...1
 import csv
 import io
 import os
-import re
 import sys
 
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.config import CONFIG  # noqa: E402
+from src.rewards import SHEET, results_tabs  # noqa: E402
 
-SHEET = "1_Jr4C94Q-F2DsVar_Tmc15SBGLc-lSVCjwgkQ6f_3po"
 BASE = "https://mainnet.zklighter.elliot.ai"
 
 
@@ -37,9 +36,7 @@ def main() -> None:
     short = f"{addr[:6]}...{addr[-4:]}".lower()
     print(f"account {CONFIG.account_index}, address {addr} (shown in the sheet as {addr[:6]}...{addr[-4:]})\n")
 
-    html = requests.get(f"https://docs.google.com/spreadsheets/d/{SHEET}/htmlview", timeout=20).text
-    tabs = [(n, g) for n, g in re.findall(r'\{name: "([^"]+)", pageUrl: "[^"]*", gid: "(\d+)"', html)
-            if n.startswith("Rewards")]
+    tabs = results_tabs()
     if not tabs:
         raise SystemExit("no Rewards tabs found — has the spreadsheet layout changed?")
     for name, gid in tabs[:4]:

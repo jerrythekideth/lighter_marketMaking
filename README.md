@@ -58,6 +58,9 @@ minutes before each one** (no new inventory into the event):
 | FX | 16:58–17:05 daily, Sun 16:55–17:10 |
 | crypto, pre-IPO | only the "all" windows |
 
+Markets that drop off the current week's reward list (re-read every 3h) go reduce-only:
+the bot unwinds their position passively and stops adding risk (`REQUIRE_REWARDED=true`).
+
 RWA weekends are the *quiet* part (median hourly move ~1/3 of weekdays); the danger is the
 reopen, which the windows cover. Markets not listed in `sessions.py` are refused. FOMC dates are
 hardcoded through 2027 — add 2028 when the Fed publishes them.
@@ -97,7 +100,9 @@ cp .env.example .env                               # fill in account index + API
 DRY_RUN=true .venv/bin/python run_mm.py            # live data, paper orders — Ctrl-C to stop
 nohup .venv/bin/python -u run_mm.py >> data/mm_live.log 2>&1 &   # live (DRY_RUN=false in .env)
 tail -f data/mm_live.log                           # watch; HEARTBEAT line every 5 min
-touch data/STOP                                    # graceful stop (delete the file to restart)
+tools/start.sh                                     # start in background (or the nohup line above)
+tools/stop.sh                                      # stop: cancel orders, close positions, wait for it
+tools/stop.sh --shutdown                           # same, then shut the Mac down
 ```
 
 Weekly: check your address in the "Rewards …" tab of the spreadsheet on Mondays and compare

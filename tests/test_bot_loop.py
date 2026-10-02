@@ -66,6 +66,7 @@ def bot(tmp_path, monkeypatch):
     b.feed = FakeFeed([SOL.market_id])
     b.daily = DailyLoss(10, path=str(tmp_path / "state.json"))
     b.vols = {SOL.market_id: 20.0}
+    b._timers["rewards"] = time.monotonic()
     b.feed.set_book(SOL.market_id, 120.000, 120.010)
     return b
 
@@ -326,3 +327,29 @@ def test_dms_refresh_waits_for_free_slot_but_forced_when_old(bot):
     bot._timers["dms"] = now - 220           # past DMS_FORCE_SECONDS -> arm even if paid
     run(bot.step())
     assert armed == [run_mm.DMS_SECONDS]
+
+
+def test_market_off_reward_list_goes_reduce_only(bot):
+    bot._timers["rewards"] = time.monotonic()         # don't hit the network in step()
+    bot.rewarded, bot.reward_week = {"ANTHROPIC"}, "Oct 5th - Oct 12th"
+    bot.t.acct.positions = {SOL.market_id: Position(size=0.2, value_usd=24.0, unrealized_pnl=0)}
+    run(bot.step())
+    assert [o.is_ask for o in bot_orders(bot)] == [True]       # only unwinds the long
+    assert "not in LP rewards" in bot.status[SOL.market_id]
+
+
+def test_unknown_reward_list_does_not_block(bot):
+    bot._timers["rewards"] = time.monotonic()
+    bot.rewarded = None                                # sheet never fetched (e.g. Google down)
+    run(bot.step())
+    assert len(bot_orders(bot)) == 2
+
+
+def test_reward_refresh_failure_keeps_last_list(bot, monkeypatch):
+    bot.rewarded, bot.reward_week = {"SOL"}, "w1"
+
+    def boom():
+        raise RuntimeError("google down")
+    monkeypatch.setattr(run_mm, "current_week", boom)
+    run(bot._refresh_rewards())
+    assert bot.rewarded == {"SOL"} and bot.reward_week == "w1"
