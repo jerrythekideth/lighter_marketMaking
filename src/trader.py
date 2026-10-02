@@ -93,11 +93,17 @@ class AccountSnapshot:
 
 
 class TxBudget:
-    """Decides whether a quota-consuming tx (create/modify) may be sent now.
+    """Decides whether a quota-consuming tx may be sent now.
 
-    Above `reserve` quota we allow up to `max_per_min` creates/modifies per minute. At or
-    below it we fall back to the free slot only (one per 15s), so quota never hits zero and
-    the bot degrades to slower requoting instead of failing. Cancels never go through here.
+    Volume quota (docs: Volume Quota) is consumed by CreateOrder, ModifyOrder and
+    CancelAllOrders — the last one includes the dead man's switch refresh. One sendTx every
+    15s is free, but the free slot goes to whichever tx comes first, *including cancels*
+    (which never cost quota themselves). Measured 2026-10-01/02: quota drained 300 -> 27 in
+    ~20h because cancels and DMS refreshes were eating the free slots. So every tx is noted
+    here, and "free" means nothing at all was sent in the last FREE_SLOT_S seconds.
+
+    Above `reserve` quota: up to `max_per_min` paid txs per minute. At or below it: free
+    slot only, so quota never runs out and requoting just gets slower.
     """
 
     FREE_SLOT_S = 15.5
@@ -105,23 +111,34 @@ class TxBudget:
     def __init__(self, reserve: int, max_per_min: int):
         self.reserve = reserve
         self.max_per_min = max_per_min
-        self.quota_remaining: int | None = None  # unknown until the first paid tx reports it
-        self._sent: list[float] = []
+        self.quota_remaining: int | None = None  # unknown until a paid tx reports it
+        self._paid: list[float] = []      # creates/modifies/cancel-alls sent
+        self._last_any = 0.0              # last tx of ANY kind, cancels included
 
     def _prune(self, now: float) -> None:
-        self._sent = [t for t in self._sent if t > now - 60]
+        self._paid = [t for t in self._paid if t > now - 60]
+
+    def free_slot_ready(self) -> bool:
+        return time.monotonic() - self._last_any >= self.FREE_SLOT_S
 
     def can_spend(self) -> bool:
         now = time.monotonic()
         self._prune(now)
-        if len(self._sent) >= self.max_per_min:
+        if len(self._paid) >= self.max_per_min:
             return False
         if self.quota_remaining is not None and self.quota_remaining <= self.reserve:
-            return not self._sent or now - self._sent[-1] >= self.FREE_SLOT_S
+            return self.free_slot_ready()
         return True
 
+    def note_tx(self) -> None:
+        """Any sendTx (incl. cancels): it may take the free slot."""
+        self._last_any = time.monotonic()
+
     def record(self, resp) -> None:
-        self._sent.append(time.monotonic())
+        """A quota-type tx (create/modify/cancel-all) was sent."""
+        now = time.monotonic()
+        self._paid.append(now)
+        self._last_any = now
         q = getattr(resp, "volume_quota_remaining", None)
         if isinstance(q, int):
             self.quota_remaining = q
@@ -307,6 +324,14 @@ class Trader:
         except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
             return None, None, f"{type(e).__name__}: {e}"
 
+    def _too_big(self, what: str, notional: float) -> bool:
+        ceiling = self.cfg.order_ceiling_usd()
+        if notional > ceiling:
+            self.consecutive_tx_errors += 1
+            log.error("REFUSED %s: notional $%.2f > hard ceiling $%.2f (sizing bug?)", what, notional, ceiling)
+            return True
+        return False
+
     def _tx_result(self, what: str, resp, err) -> bool:
         if _ok(resp, err):
             self.consecutive_tx_errors = 0
@@ -320,6 +345,8 @@ class Trader:
         spec = self.specs[market_id]
         px, base = price_int / 10 ** spec.price_decimals, base_int / 10 ** spec.size_decimals
         side = "ask" if is_ask else "bid"
+        if self._too_big(f"place {symbol} {side}", base * px):
+            return None
         coi = self._next_coi()
         expected = BotOrder(-1, coi, market_id, is_ask, px, base)
         if self.cfg.dry_run:
@@ -347,6 +374,8 @@ class Trader:
         spec = self.specs[order.market_id]
         px = price_int / 10 ** spec.price_decimals
         side = "ask" if order.is_ask else "bid"
+        if self._too_big(f"modify {symbol} {side}", base_int / 10 ** spec.size_decimals * px):
+            return False
         if self.cfg.dry_run:
             self._paper[order.client_order_index] = BotOrder(
                 order.order_index, order.client_order_index, order.market_id, order.is_ask, px,
@@ -375,6 +404,7 @@ class Trader:
         _, resp, err = await self._tx(self._client.cancel_order(
             market_index=order.market_id, order_index=order.client_order_index,
         ))
+        self.budget.note_tx()
         if self._tx_result(f"cancel {symbol} {side}", resp, err):
             log.info("cancelled %s %s @ %s %s", symbol, side, order.price, why)
             return True
@@ -393,6 +423,7 @@ class Trader:
         _, resp, err = await self._tx(self._client.cancel_all_orders(
             time_in_force=lighter.SignerClient.CANCEL_ALL_TIF_SCHEDULED, timestamp_ms=ts_ms,
         ))
+        self.budget.record(resp)
         if not _ok(resp, err):
             log.error("arming dead man's switch failed: %s", err or resp)
             return False
@@ -404,6 +435,7 @@ class Trader:
         _, resp, err = await self._tx(self._client.cancel_all_orders(
             time_in_force=lighter.SignerClient.CANCEL_ALL_TIF_ABORT, timestamp_ms=0,
         ))
+        self.budget.record(resp)
         if not _ok(resp, err):
             log.error("disarming dead man's switch failed: %s", err or resp)
         else:
@@ -475,6 +507,7 @@ class Trader:
         _, resp, err = await self._tx(self._client.cancel_all_orders(
             time_in_force=lighter.SignerClient.CANCEL_ALL_TIF_IMMEDIATE, timestamp_ms=0,
         ))
+        self.budget.record(resp)
         if not _ok(resp, err):
             log.error("immediate cancel-all failed: %s", err or resp)
             return False

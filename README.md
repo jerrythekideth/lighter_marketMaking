@@ -31,8 +31,11 @@ and its [public spreadsheet](https://docs.google.com/spreadsheets/d/1_Jr4C94Q-F2
    only · session blackout (`src/sessions.py`) · book too wide or mid far from mark price ·
    volatility breaker (mid moved > max(40bps, 2× hourly vol) in 30s → out for 5 min).
 3. **Quote** — join the best bid/ask (step one tick inside when the spread ≥ 10bps), but no
-   closer to mid than max(1bp, 0.1 × hourly vol), shifted against inventory (skew). Position cap
-   per market: the side that would breach it stops quoting.
+   closer to mid than max(MIN_EDGE_BPS, EDGE_VOL_MULT × hourly vol), shifted against inventory
+   (skew). Default is pure join (0.5bp / 0): on 2026-10-01 a vol-scaled edge left orders ~6bps
+   behind the top, where they earned ~0 rewards but still got picked off. Position cap per
+   market: the side that would breach it stops quoting. `MARKET_PARAMS` overrides any of these
+   per market; `HARD_MAX_ORDER_USD` is a last-line ceiling checked just before signing.
 4. **Reconcile** with the bot's resting orders using modify (1 tx) instead of cancel+place.
 
 All orders are post-only (never pay taker fees). The bot only ever touches orders it tagged
@@ -61,8 +64,10 @@ hardcoded through 2027 — add 2028 when the Fed publishes them.
 
 ### Volume quota — the real constraint for a small account
 
-Premium accounts spend 1 "volume quota" per order create/modify (cancels are free), get one free
-tx every 15s, and earn 1 quota per $2 traded. The bot reads the remaining quota from every
+Premium accounts spend 1 "volume quota" per order create/modify **and per cancel-all — which
+includes every dead man's switch refresh** (single cancels are free), get one free tx every 15s
+(taken by *any* tx, cancels too), and earn 1 quota per $2 traded. The bot refreshes the switch
+only in a free slot (forced after 210s), and counts every tx against the free slot. The bot reads the remaining quota from every
 response (`HEARTBEAT ... quota=`), caps paid updates at `MAX_PAID_TX_PER_MIN`, and below
 `QUOTA_RESERVE` drops to the free slot only. When it can't afford to move an order that the
 market has moved against, it cancels it (free) instead. More markets = more updates = faster
@@ -88,7 +93,7 @@ quota burn; 3–5 markets is the sweet spot at this size.
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 cp .env.example .env                               # fill in account index + API key
 .venv/bin/python tools/rank_markets.py             # pick MARKETS (Mondays)
-.venv/bin/pytest -q tests                          # 50 offline tests
+.venv/bin/pytest -q tests                          # offline tests
 DRY_RUN=true .venv/bin/python run_mm.py            # live data, paper orders — Ctrl-C to stop
 nohup .venv/bin/python -u run_mm.py >> data/mm_live.log 2>&1 &   # live (DRY_RUN=false in .env)
 tail -f data/mm_live.log                           # watch; HEARTBEAT line every 5 min

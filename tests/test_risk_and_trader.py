@@ -55,7 +55,8 @@ def test_tx_budget_rate_and_reserve():
     b = TxBudget(reserve=100, max_per_min=50)
     b.record(SimpleNamespace(volume_quota_remaining=90))
     assert not b.can_spend()           # at/below reserve: only the 15s free slot
-    b._sent = [time.monotonic() - 16]
+    b._paid = [time.monotonic() - 16]
+    b._last_any = time.monotonic() - 16
     assert b.can_spend()
     b.record(SimpleNamespace(volume_quota_remaining=None))  # free tx doesn't report quota
     assert b.quota_remaining == 90
@@ -216,3 +217,65 @@ def test_tx_timeout_returns_error_instead_of_hanging(monkeypatch):
         await asyncio.sleep(10)
     _, resp, err = asyncio.run(t._tx(hang()))
     assert resp is None and "Timeout" in err
+
+
+def test_cancel_takes_the_free_slot():
+    # Below reserve, a paid tx is only "free" if NOTHING (not even a cancel) went out in 15s.
+    b = TxBudget(reserve=100, max_per_min=50)
+    b.record(SimpleNamespace(volume_quota_remaining=50))
+    b._paid, b._last_any = [], time.monotonic() - 20
+    assert b.can_spend() and b.free_slot_ready()
+    b.note_tx()                       # a cancel just went out
+    assert not b.free_slot_ready() and not b.can_spend()
+
+
+def test_cancel_all_counts_as_quota_tx():
+    import asyncio
+    t = _live_trader()
+
+    class Client:
+        async def cancel_all_orders(self, **kw):
+            return None, SimpleNamespace(code=200, volume_quota_remaining=77), None
+    t._client = Client()
+    assert asyncio.run(t.arm_dead_mans_switch(330))
+    assert t.budget.quota_remaining == 77 and len(t.budget._paid) == 1
+
+
+def test_market_overrides_and_validation():
+    import dataclasses
+    import pytest
+    from src.config import CONFIG
+    c = dataclasses.replace(CONFIG, markets=("ANTHROPIC", "AMD"), max_order_usd=20, max_position_usd=40,
+                            market_params={"ANTHROPIC": {"max_order_usd": 50, "max_position_usd": 100,
+                                                         "min_edge_bps": 0.5}}, hard_max_order_usd=0)
+    assert c.for_market("ANTHROPIC", "max_order_usd") == 50 and c.for_market("AMD", "max_order_usd") == 20
+    assert c.for_market("ANTHROPIC", "min_edge_bps") == 0.5
+    assert c.order_ceiling_usd() == 100
+    c.validate()
+    with pytest.raises(ValueError):
+        dataclasses.replace(c, market_params={"X": {"max_order_usd": 50, "max_position_usd": 10}}).validate()
+    with pytest.raises(ValueError):
+        dataclasses.replace(c, market_params={"X": {"oops": 1}}).validate()
+
+
+def test_hard_ceiling_refuses_oversized_orders():
+    import asyncio
+    t = _live_trader()
+    t.cfg.order_ceiling_usd = lambda: 50.0
+    t.specs = {92: MarketSpec(92, "XAU", 4, 2, 0.0015, 10.0, "active", False, 0.0666)}
+
+    class Client:
+        async def create_order(self, **kw):
+            raise AssertionError("must not be sent")
+    t._client = Client()
+    assert asyncio.run(t.place("XAU", 92, False, 418500, 500)) is None   # 0.05 XAU = $209
+    assert t.consecutive_tx_errors == 1
+
+
+def test_pong_keeps_feed_healthy():
+    from src.feed import MarketFeed
+    f = MarketFeed("wss://x", [1])
+    f.connected, f.last_msg_at = True, time.monotonic() - 30
+    assert not f.healthy(10)
+    f._on_message({"type": "pong"})
+    assert f.healthy(10)

@@ -1,4 +1,5 @@
 """Single place all tunables are loaded from. Everything else imports from here."""
+import json
 import os
 from dataclasses import dataclass, field
 
@@ -59,6 +60,13 @@ class Config:
     # Keep at least this fraction of equity as available balance; below it, reduce-only.
     min_free_margin_frac: float = field(default_factory=lambda: _float("MIN_FREE_MARGIN_FRAC", 0.3))
 
+    # Per-market overrides, JSON: {"ANTHROPIC": {"max_order_usd": 30, "min_edge_bps": 0.5}}.
+    # Keys: max_order_usd, max_position_usd, min_edge_bps, edge_vol_mult, skew_bps_at_cap.
+    market_params: dict = field(default_factory=lambda: json.loads(os.getenv("MARKET_PARAMS") or "{}"))
+    # Absolute ceiling on any single order's notional, checked right before signing. A bug in
+    # sizing can never send more than this. Default: 2x the largest configured order size.
+    hard_max_order_usd: float = field(default_factory=lambda: _float("HARD_MAX_ORDER_USD", 0))
+
     # --- quoting ---
     # Half-spread floor from fair price: max(MIN_EDGE_BPS, EDGE_VOL_MULT * 1h volatility bps).
     # Within that floor the bot joins the best bid/ask (where liquidity rewards are highest).
@@ -103,6 +111,32 @@ class Config:
     # Below this remaining volume quota, only use the free tx slot (1 per 15s).
     quota_reserve: int = field(default_factory=lambda: _int("QUOTA_RESERVE", 300))
     max_paid_tx_per_min: int = field(default_factory=lambda: _int("MAX_PAID_TX_PER_MIN", 8))
+
+    _OVERRIDABLE = ("max_order_usd", "max_position_usd", "min_edge_bps", "edge_vol_mult", "skew_bps_at_cap")
+
+    def for_market(self, symbol: str, name: str) -> float:
+        if name not in self._OVERRIDABLE:
+            raise KeyError(name)
+        return float((self.market_params.get(symbol) or {}).get(name, getattr(self, name)))
+
+    def order_ceiling_usd(self) -> float:
+        if self.hard_max_order_usd > 0:
+            return self.hard_max_order_usd
+        sizes = [self.max_order_usd] + [float(p.get("max_order_usd", 0)) for p in self.market_params.values()]
+        return 2 * max(sizes)
+
+    def validate(self) -> None:
+        """Fail fast on config mistakes instead of trading with them."""
+        for sym, params in self.market_params.items():
+            bad = set(params) - set(self._OVERRIDABLE)
+            if bad:
+                raise ValueError(f"MARKET_PARAMS[{sym}]: unknown keys {sorted(bad)}")
+        for sym in set(self.markets) | set(self.market_params):
+            order, pos = self.for_market(sym, "max_order_usd"), self.for_market(sym, "max_position_usd")
+            if order <= 0 or pos < order:
+                raise ValueError(f"{sym}: need 0 < max_order_usd ({order}) <= max_position_usd ({pos})")
+        if self.daily_loss_limit_usd <= 0:
+            raise ValueError("DAILY_LOSS_LIMIT_USD must be > 0")
 
     @property
     def ws_url(self) -> str:

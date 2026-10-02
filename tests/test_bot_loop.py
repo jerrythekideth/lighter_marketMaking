@@ -308,3 +308,21 @@ def test_loop_survives_step_exception_then_halts_after_sustained_failure(bot, mo
 
 async def _no_sleep(_):
     return None
+
+
+def test_dms_refresh_waits_for_free_slot_but_forced_when_old(bot):
+    armed = []
+
+    async def arm(seconds):
+        armed.append(seconds)
+        return True
+    bot.t.arm_dead_mans_switch = arm
+    now = time.monotonic()
+    bot._timers["dms"] = now - 100           # due, but a tx just went out -> wait for free slot
+    bot.t.budget._last_any = now
+    bot.feed.ok = False                       # keep the step from placing orders
+    run(bot.step())
+    assert armed == []
+    bot._timers["dms"] = now - 220           # past DMS_FORCE_SECONDS -> arm even if paid
+    run(bot.step())
+    assert armed == [run_mm.DMS_SECONDS]

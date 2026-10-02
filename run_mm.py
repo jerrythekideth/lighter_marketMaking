@@ -46,7 +46,11 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 STOP_FILE = os.path.join(ROOT, "data", "STOP")
 
 DMS_SECONDS = 330          # Lighter's minimum is 300s out
+# The DMS refresh is a CancelAllOrders tx, which costs volume quota unless it lands in the
+# free 15s slot. So: refresh opportunistically in a free slot once it's this old...
 DMS_REFRESH_SECONDS = 60
+# ...but always (even if paid) once it's this old, leaving 90s+ before it would fire.
+DMS_FORCE_SECONDS = 210
 SPECS_REFRESH_SECONDS = 300
 VOL_REFRESH_SECONDS = 3600
 HEARTBEAT_SECONDS = 300
@@ -237,12 +241,13 @@ class Bot:
 
         pos = self.acct.position(m).value_usd
         reduce_reason = why if sess == REDUCE_ONLY else global_reduce
-        edge = half_edge_bps(vol, self.cfg.min_edge_bps, self.cfg.edge_vol_mult)
+        p = lambda name: self.cfg.for_market(symbol, name)  # per-market override or global
+        order_usd, max_pos = p("max_order_usd"), p("max_position_usd")
+        edge = half_edge_bps(vol, p("min_edge_bps"), p("edge_vol_mult"))
         q = compute_quote(st.bid, st.ask, st.mid, spec.price_decimals, edge, pos,
-                          self.cfg.max_position_usd, self.cfg.skew_bps_at_cap, self.cfg.improve_spread_bps)
-        bid_ok, ask_ok = sides_allowed(pos, self.cfg.max_order_usd, self.cfg.max_position_usd,
-                                       reduce_reason is not None)
-        size = min(self.cfg.max_order_usd, abs(pos)) if reduce_reason else self.cfg.max_order_usd
+                          max_pos, p("skew_bps_at_cap"), self.cfg.improve_spread_bps)
+        bid_ok, ask_ok = sides_allowed(pos, order_usd, max_pos, reduce_reason is not None)
+        size = min(order_usd, abs(pos)) if reduce_reason else order_usd
         self._set_status(symbol, m, f"REDUCE-ONLY ({reduce_reason})" if reduce_reason else "QUOTING")
 
         reduce = reduce_reason is not None
@@ -328,9 +333,10 @@ class Bot:
         if os.path.exists(STOP_FILE):
             log.warning("STOP file found — shutting down")
             return False
-        if self._due("dms", DMS_REFRESH_SECONDS):
-            if not await self.t.arm_dead_mans_switch(DMS_SECONDS):
-                self._timers["dms"] = 0.0  # retry next loop
+        dms_age = time.monotonic() - self._timers.get("dms", 0.0)
+        if dms_age >= DMS_FORCE_SECONDS or (dms_age >= DMS_REFRESH_SECONDS and self.t.budget.free_slot_ready()):
+            if await self.t.arm_dead_mans_switch(DMS_SECONDS):
+                self._timers["dms"] = time.monotonic()
         if self._due("specs", SPECS_REFRESH_SECONDS):
             try:
                 await self.t.load_specs()
@@ -414,6 +420,7 @@ async def main() -> None:
     if CONFIG.is_mainnet() and not CONFIG.dry_run:
         log.warning("MAINNET + LIVE ORDERS")
 
+    CONFIG.validate()
     trader = Trader(CONFIG)
     await trader.connect()
     try:

@@ -22,6 +22,10 @@ import websockets
 log = logging.getLogger("feed")
 
 MID_HISTORY_SECONDS = 300
+# App-level ping (docs: {"type":"ping"} -> {"type":"pong"}). Quiet markets can go >10s
+# without a ticker/stats message; the pong proves the connection is alive so the bot
+# doesn't pull all quotes on a false "feed down" (seen 5x/day with 2-4 quiet markets).
+APP_PING_SECONDS = 5
 
 
 @dataclass
@@ -112,6 +116,11 @@ class MarketFeed:
         elif mtype == "error" or "error" in msg:
             log.error("ws error message: %s", msg)
 
+    async def _ping(self, ws) -> None:
+        while True:
+            await asyncio.sleep(APP_PING_SECONDS)
+            await ws.send(json.dumps({"type": "ping"}))
+
     async def run(self) -> None:
         backoff = 1.0
         while True:
@@ -126,8 +135,12 @@ class MarketFeed:
                     self.connected = True
                     backoff = 1.0
                     log.info("feed connected, %d markets", len(self.market_ids))
-                    async for raw in ws:
-                        self._on_message(json.loads(raw))
+                    pinger = asyncio.create_task(self._ping(ws))
+                    try:
+                        async for raw in ws:
+                            self._on_message(json.loads(raw))
+                    finally:
+                        pinger.cancel()
             except asyncio.CancelledError:
                 self.connected = False
                 raise
