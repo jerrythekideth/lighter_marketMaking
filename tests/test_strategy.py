@@ -86,3 +86,21 @@ def test_requote_and_danger():
     # ask below target (market rose) is dangerous.
     assert is_dangerous(True, 99.95, 100.00, 1.0)
     assert not is_dangerous(True, 100.05, 100.00, 1.0)
+
+
+def test_unwind_price_never_worse_than_mark():
+    from src.strategy import unwind_price
+    # OPENAI 2026-09-30: book ~1715, mark 1665, we're long -> sell at the (better) book ask.
+    assert unwind_price(20, 1715.10, 1715.56, 1665.10, 2) == 171556
+    # Long but book BELOW mark -> wait at mark, don't dump into the book.
+    assert unwind_price(20, 1600.00, 1600.50, 1665.10, 2) == 166510
+    # Short, book above mark -> buy back at mark, not at the inflated book.
+    assert unwind_price(-20, 1715.10, 1715.56, 1665.10, 2) == 166510
+    # Short, book below mark -> join the (better) best bid.
+    assert unwind_price(-20, 1600.00, 1600.50, 1665.10, 2) == 160000
+    # Post-only: never cross. Long, mark below the bid -> at least bid + 1 tick.
+    assert unwind_price(20, 1700.00, None, 1690.00, 2) == 170001
+    # One-sided / no mark / flat.
+    assert unwind_price(20, None, None, 1665.10, 2) == 166510
+    assert unwind_price(20, 1700.0, 1701.0, None, 2) is None
+    assert unwind_price(0, 1700.0, 1701.0, 1700.5, 2) is None

@@ -353,3 +353,39 @@ def test_reward_refresh_failure_keeps_last_list(bot, monkeypatch):
     monkeypatch.setattr(run_mm, "current_week", boom)
     run(bot._refresh_rewards())
     assert bot.rewarded == {"SOL"} and bot.reward_week == "w1"
+
+
+def test_dislocated_book_keeps_unwinding_position(bot):
+    # Long $24, mid 300bps above mark (book problem) -> only a sell, at the book ask (>= mark).
+    bot.t.acct.positions = {SOL.market_id: Position(size=0.2, value_usd=24.0, unrealized_pnl=0)}
+    bot.feed.set_book(SOL.market_id, 120.000, 120.010, mark=116.4)
+    run(bot.step())
+    orders = bot_orders(bot)
+    assert [o.is_ask for o in orders] == [True]
+    assert orders[0].price >= 120.010 and orders[0].remaining_base * orders[0].price <= 20.0 + 1e-6
+    assert "unwinding" in bot.status[SOL.market_id]
+
+
+def test_dislocated_book_short_waits_at_mark(bot):
+    # Short with the book above mark: buy back at mark, never chase the inflated book.
+    bot.t.acct.positions = {SOL.market_id: Position(size=-0.1, value_usd=-12.0, unrealized_pnl=0)}
+    bot.feed.set_book(SOL.market_id, 120.000, 120.010, mark=116.4)
+    run(bot.step())
+    orders = bot_orders(bot)
+    assert [o.is_ask for o in orders] == [False] and abs(orders[0].price - 116.4) < 1e-9
+
+
+def test_breaker_with_position_unwinds_without_adding(bot):
+    run(bot.step())
+    bot.t.acct.positions = {SOL.market_id: Position(size=0.2, value_usd=24.0, unrealized_pnl=0)}
+    bot.feed.set_book(SOL.market_id, 120.72, 120.73)        # 60bps jump -> breaker
+    run(bot.step())
+    assert bot.guards[SOL.market_id].paused
+    assert [o.is_ask for o in bot_orders(bot)] == [True]   # sell only, nothing that adds risk
+
+
+def test_dislocated_book_flat_pulls_everything(bot):
+    run(bot.step())
+    bot.feed.set_book(SOL.market_id, 120.000, 120.010, mark=116.4)
+    run(bot.step())
+    assert bot_orders(bot) == []

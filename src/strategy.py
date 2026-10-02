@@ -92,3 +92,27 @@ def is_dangerous(is_ask: bool, current_price: float, target_price: float, requot
     against it). These get cancelled even when quota is short — cancels are free."""
     diff_bps = (current_price - target_price) / target_price * 1e4
     return (-diff_bps if is_ask else diff_bps) > requote_bps
+
+
+def unwind_price(net_position_usd: float, best_bid: float | None, best_ask: float | None,
+                 mark: float | None, price_decimals: int) -> int | None:
+    """Passive price (integer ticks) for an order that only shrinks a position while the
+    market isn't quotable (dislocated book, breaker). Never worse than Lighter's mark price
+    — a long is sold at max(best ask, mark), a short bought back at min(best bid, mark) —
+    and never crossing the book (post-only). None if flat or there's no mark."""
+    if mark is None or mark <= 0 or abs(net_position_usd) < 1e-9:
+        return None
+    scale = 10 ** price_decimals
+    if net_position_usd > 0:   # long -> sell
+        px = math.ceil(mark * scale - 1e-9)
+        if best_ask:
+            px = max(px, round(best_ask * scale))
+        if best_bid:
+            px = max(px, round(best_bid * scale) + 1)
+    else:                      # short -> buy back
+        px = math.floor(mark * scale + 1e-9)
+        if best_bid:
+            px = min(px, round(best_bid * scale))
+        if best_ask:
+            px = min(px, round(best_ask * scale) - 1)
+    return px if px > 0 else None

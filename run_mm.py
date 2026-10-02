@@ -36,7 +36,9 @@ from src.feed import MarketFeed
 from src.rewards import current_week
 from src.risk import DailyLoss, MarketGuard, book_problem, recent_trips
 from src.sessions import ASSET_CLASS, BLACKOUT, REDUCE_ONLY, session_state
-from src.strategy import compute_quote, half_edge_bps, is_dangerous, needs_requote, sides_allowed
+from src.strategy import (
+    compute_quote, half_edge_bps, is_dangerous, needs_requote, sides_allowed, unwind_price,
+)
 from src.trader import BotOrder, Trader
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -221,6 +223,23 @@ class Bot:
         elif is_dangerous(is_ask, cur.price, tgt_px, self.cfg.requote_bps):
             await self._cancel_local(symbol, m, cur, "(moved against us, no quota to modify)")
 
+    async def _unwind_only(self, symbol: str, m: int, status: str) -> None:
+        """Market isn't quotable, but don't abandon a position in it (2026-09-30: an OPENAI long
+        sat unmanaged for hours while book and mark disagreed). Keep one passive, position-sized
+        order that only shrinks it, priced no worse than mark; pull everything else."""
+        st = self.feed.markets[m]
+        spec = self.t.specs[m]
+        pos = self.acct.position(m).value_usd
+        px = unwind_price(pos, st.bid, st.ask, st.mark, spec.price_decimals)
+        if px is None:
+            self._set_status(symbol, m, status)
+            return await self._pull_market(symbol, m, f"({status})")
+        self._set_status(symbol, m, f"{status} — unwinding at mark or better")
+        size = min(self.cfg.for_market(symbol, "max_order_usd"), abs(pos))
+        sell = pos > 0
+        await self._reconcile_side(symbol, m, not sell, None, size, True)   # pull the other side
+        await self._reconcile_side(symbol, m, sell, px, size, True)
+
     async def _market(self, symbol: str, m: int, now_utc: dt.datetime, global_reduce: str | None,
                       systemic: bool) -> None:
         spec = self.t.specs.get(m)
@@ -238,8 +257,7 @@ class Bot:
         problem = book_problem(st.bid, st.ask, st.mark, self.cfg.max_book_spread_bps,
                                self.cfg.max_mark_divergence_bps)
         if problem:
-            self._set_status(symbol, m, f"WAIT ({problem})")
-            return await self._pull_market(symbol, m, f"({problem})")
+            return await self._unwind_only(symbol, m, f"WAIT ({problem})")
 
         vol = self.vols.get(m)
         if vol is None:
@@ -254,8 +272,7 @@ class Bot:
         if systemic and not guard.paused:
             guard.pause(self.cfg.breaker_pause_s * 2, "systemic breaker")
         if guard.paused:
-            self._set_status(symbol, m, f"PAUSED ({guard.reason})")
-            return await self._pull_market(symbol, m, "(breaker)")
+            return await self._unwind_only(symbol, m, f"PAUSED ({guard.reason})")
 
         pos = self.acct.position(m).value_usd
         unrewarded = (self.cfg.require_rewarded and self.rewarded is not None and symbol not in self.rewarded)
