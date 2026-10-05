@@ -279,3 +279,10 @@ def test_pong_keeps_feed_healthy():
     assert not f.healthy(10)
     f._on_message({"type": "pong"})
     assert f.healthy(10)
+
+
+def test_budget_respects_total_tx_rate():
+    b = TxBudget(reserve=0, max_per_min=100)
+    for _ in range(TxBudget.MAX_ANY_TX_PER_MIN):
+        b.note_tx()                    # e.g. a burst of cancels
+    assert not b.can_spend()

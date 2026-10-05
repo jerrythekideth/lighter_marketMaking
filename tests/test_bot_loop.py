@@ -389,3 +389,29 @@ def test_dislocated_book_flat_pulls_everything(bot):
     bot.feed.set_book(SOL.market_id, 120.000, 120.010, mark=116.4)
     run(bot.step())
     assert bot_orders(bot) == []
+
+
+def test_at_top_tracking_and_heartbeat(bot, caplog):
+    import logging
+    bot.cfg = dataclasses.replace(bot.cfg, min_edge_bps=0.1, edge_vol_mult=0.0)
+    bot.feed.set_book(SOL.market_id, 120.000, 120.100)   # wide enough that we join (improve off)
+    bot.cfg = dataclasses.replace(bot.cfg, improve_spread_bps=1e9)
+    run(bot.step())
+    run(bot.step())
+    c_bid = bot.at_top[(SOL.market_id, False)]
+    assert c_bid[1] >= 1 and c_bid[0] == c_bid[1]           # always at the best bid
+    caplog.set_level(logging.INFO, logger="mm")
+    bot._heartbeat(0.0)
+    assert "at_best(bid/ask)={'SOL': '100/100%'}" in caplog.records[-1].getMessage()
+    assert bot.at_top == {}
+
+
+def test_per_market_requote_threshold(bot):
+    bot.cfg = dataclasses.replace(bot.cfg, market_params={"SOL": {"requote_bps": 0.1}})
+    run(bot.step())
+    before = {o.client_order_index: o.price for o in bot_orders(bot)}
+    bot.feed.markets[SOL.market_id].mids.clear()
+    bot.feed.set_book(SOL.market_id, 120.003, 120.013)      # +0.25bps: moves with 0.1, not with 1.0
+    run(bot.step())
+    after = {o.client_order_index: o.price for o in bot_orders(bot)}
+    assert after.keys() == before.keys() and after != before

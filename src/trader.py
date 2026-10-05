@@ -107,16 +107,21 @@ class TxBudget:
     """
 
     FREE_SLOT_S = 15.5
+    # Lighter's per-account limit for most tx types is 40/min (docs: Rate Limits, "Default").
+    # Stay under it counting EVERY tx; cancels are never blocked (they're the safety path).
+    MAX_ANY_TX_PER_MIN = 35
 
     def __init__(self, reserve: int, max_per_min: int):
         self.reserve = reserve
         self.max_per_min = max_per_min
         self.quota_remaining: int | None = None  # unknown until a paid tx reports it
         self._paid: list[float] = []      # creates/modifies/cancel-alls sent
+        self._any: list[float] = []       # every tx, cancels included
         self._last_any = 0.0              # last tx of ANY kind, cancels included
 
     def _prune(self, now: float) -> None:
         self._paid = [t for t in self._paid if t > now - 60]
+        self._any = [t for t in self._any if t > now - 60]
 
     def free_slot_ready(self) -> bool:
         return time.monotonic() - self._last_any >= self.FREE_SLOT_S
@@ -124,7 +129,7 @@ class TxBudget:
     def can_spend(self) -> bool:
         now = time.monotonic()
         self._prune(now)
-        if len(self._paid) >= self.max_per_min:
+        if len(self._paid) >= self.max_per_min or len(self._any) >= self.MAX_ANY_TX_PER_MIN:
             return False
         if self.quota_remaining is not None and self.quota_remaining <= self.reserve:
             return self.free_slot_ready()
@@ -133,11 +138,13 @@ class TxBudget:
     def note_tx(self) -> None:
         """Any sendTx (incl. cancels): it may take the free slot."""
         self._last_any = time.monotonic()
+        self._any.append(self._last_any)
 
     def record(self, resp) -> None:
         """A quota-type tx (create/modify/cancel-all) was sent."""
         now = time.monotonic()
         self._paid.append(now)
+        self._any.append(now)
         self._last_any = now
         q = getattr(resp, "volume_quota_remaining", None)
         if isinstance(q, int):

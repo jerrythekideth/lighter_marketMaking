@@ -91,6 +91,9 @@ class Bot:
         self._recent_placed: dict[int, tuple[float, BotOrder]] = {}
         self._recent_cancelled: dict[int, float] = {}
         self._last_wall = time.time()
+        # Share of loop checks where our order sat exactly at the best price, per market/side
+        # (the reward multiplier is highest there). Reported and reset each heartbeat.
+        self.at_top: dict[tuple[int, bool], list[int]] = {}
         self.reward_week: str | None = None
         self.rewarded: set[str] | None = None  # None = never fetched -> don't restrict
 
@@ -169,10 +172,17 @@ class Bot:
     def _heartbeat(self, pnl: float) -> None:
         pos = {s: round(self.acct.position(m).value_usd, 2) for s, m in self.active
                if abs(self.acct.position(m).value_usd) > 0.01}
+        top = {}
+        for s, m in self.active:
+            b, a = self.at_top.get((m, False), [0, 0]), self.at_top.get((m, True), [0, 0])
+            if b[1] or a[1]:
+                top[s] = f"{b[0] * 100 // max(b[1], 1)}/{a[0] * 100 // max(a[1], 1)}%"
+        self.at_top = {}
         log.info(
-            "HEARTBEAT equity=$%.2f day_pnl=$%.2f free=$%.2f gross=$%.2f quota=%s pos=%s states=%s feed_reconnects=%d",
+            "HEARTBEAT equity=$%.2f day_pnl=$%.2f free=$%.2f gross=$%.2f quota=%s pos=%s at_best(bid/ask)=%s "
+            "states=%s feed_reconnects=%d",
             self.acct.total_asset_value, pnl, self.acct.available_balance, self.acct.gross_exposure_usd,
-            self.t.budget.quota_remaining, pos,
+            self.t.budget.quota_remaining, pos, top,
             {s: self.status.get(m, "?") for s, m in self.active}, self.feed.reconnects,
         )
 
@@ -186,6 +196,7 @@ class Bot:
 
     async def _reconcile_side(self, symbol: str, m: int, is_ask: bool, target: int | None,
                               size_usd: float, reduce_only: bool) -> None:
+        requote_bps = self.cfg.for_market(symbol, "requote_bps")
         # self.orders is refreshed from the exchange every ACCOUNT_REFRESH_S and kept in sync
         # locally in between (place/modify/cancel below), so a fast loop can't double-place.
         side_orders = [o for o in self.orders.get(m, []) if o.is_ask == is_ask]
@@ -213,14 +224,14 @@ class Bot:
                     self._recent_placed[placed.client_order_index] = (time.monotonic(), placed)
             return
 
-        stale_price = needs_requote(cur.price, tgt_px, self.cfg.requote_bps)
+        stale_price = needs_requote(cur.price, tgt_px, requote_bps)
         stale_size = cur.remaining_base < 0.5 * want_base or cur.remaining_base > 1.5 * want_base
         if not (stale_price or stale_size):
             return
         if self.t.budget.can_spend():
             if await self.t.modify(symbol, cur, target, base_int):
                 cur.price, cur.remaining_base = tgt_px, want_base
-        elif is_dangerous(is_ask, cur.price, tgt_px, self.cfg.requote_bps):
+        elif is_dangerous(is_ask, cur.price, tgt_px, requote_bps):
             await self._cancel_local(symbol, m, cur, "(moved against us, no quota to modify)")
 
     async def _unwind_only(self, symbol: str, m: int, status: str) -> None:
@@ -291,6 +302,15 @@ class Bot:
         reduce = reduce_reason is not None
         await self._reconcile_side(symbol, m, False, q.bid if bid_ok else None, size, reduce)
         await self._reconcile_side(symbol, m, True, q.ask if ask_ok else None, size, reduce)
+        self._track_top(m, st)
+
+    def _track_top(self, m: int, st) -> None:
+        for is_ask, best in ((False, st.bid), (True, st.ask)):
+            mine = [o for o in self.orders.get(m, []) if o.is_ask == is_ask]
+            c = self.at_top.setdefault((m, is_ask), [0, 0])
+            c[1] += 1
+            if mine and best is not None and abs(mine[0].price - best) < 1e-12 + best * 1e-9:
+                c[0] += 1
 
     # --- main loop ---
 

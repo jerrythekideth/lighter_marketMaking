@@ -61,7 +61,7 @@ class Config:
     min_free_margin_frac: float = field(default_factory=lambda: _float("MIN_FREE_MARGIN_FRAC", 0.3))
 
     # Per-market overrides, JSON: {"ANTHROPIC": {"max_order_usd": 30, "min_edge_bps": 0.5}}.
-    # Keys: max_order_usd, max_position_usd, min_edge_bps, edge_vol_mult, skew_bps_at_cap.
+    # Keys: max_order_usd, max_position_usd, min_edge_bps, edge_vol_mult, skew_bps_at_cap, requote_bps.
     market_params: dict = field(default_factory=lambda: json.loads(os.getenv("MARKET_PARAMS") or "{}"))
     # Absolute ceiling on any single order's notional, checked right before signing. A bug in
     # sizing can never send more than this. Default: 2x the largest configured order size.
@@ -116,7 +116,8 @@ class Config:
     quota_reserve: int = field(default_factory=lambda: _int("QUOTA_RESERVE", 300))
     max_paid_tx_per_min: int = field(default_factory=lambda: _int("MAX_PAID_TX_PER_MIN", 8))
 
-    _OVERRIDABLE = ("max_order_usd", "max_position_usd", "min_edge_bps", "edge_vol_mult", "skew_bps_at_cap")
+    _OVERRIDABLE = ("max_order_usd", "max_position_usd", "min_edge_bps", "edge_vol_mult", "skew_bps_at_cap",
+                    "requote_bps")
 
     def for_market(self, symbol: str, name: str) -> float:
         if name not in self._OVERRIDABLE:
