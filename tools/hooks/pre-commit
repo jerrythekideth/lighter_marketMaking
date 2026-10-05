@@ -1,0 +1,36 @@
+#!/bin/bash
+# Blocks a commit that would add secrets. Enabled with:  git config core.hooksPath tools/hooks
+# Checks the STAGED changes for: env/key files, the real values in .env (never printed), and
+# anything key-shaped (64+ hex chars, PRIVATE_KEY=<value>, Lighter auth tokens).
+cd "$(git rev-parse --show-toplevel)" || exit 1
+fail=0
+
+bad_files=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '(^|/)\.env($|\.)|\.pem$|\.key$|^data/' | grep -v '\.env\.example$')
+if [ -n "$bad_files" ]; then
+  echo "BLOCKED: secret/runtime files staged:"; echo "$bad_files" | sed 's/^/   /'; fail=1
+fi
+
+added=$(git diff --cached -U0 --diff-filter=ACMR | grep '^+' | grep -v '^+++')
+
+if [ -f .env ]; then
+  while IFS='=' read -r k v; do
+    case "$k" in *PRIVATE_KEY*|*PUBLIC_KEY*|*SECRET*|*TOKEN*) ;; *) continue ;; esac
+    v="${v%\"}"; v="${v#\"}"; v="${v#0x}"
+    [ ${#v} -ge 12 ] || continue
+    if printf '%s' "$added" | grep -qF -- "${v:0:16}"; then
+      echo "BLOCKED: the value of $k from .env appears in the staged changes"; fail=1
+    fi
+  done < <(grep -E '^[A-Z_]+=' .env)
+fi
+
+if printf '%s' "$added" | grep -qE '(^|[^0-9a-fA-F])(0x)?[0-9a-fA-F]{64,}'; then
+  echo "BLOCKED: a 64+ char hex string (looks like a private key) is being added"; fail=1
+fi
+if printf '%s' "$added" | grep -qiE '(private_key|secret|api_key|password)[[:space:]]*[=:][[:space:]]*["'"'"']?[A-Za-z0-9_-]{16,}'; then
+  echo "BLOCKED: something like PRIVATE_KEY=<value> is being added"; fail=1
+fi
+if printf '%s' "$added" | grep -qE '[0-9]{10}:[0-9]+:[0-9]+:[0-9a-f]{16,}'; then
+  echo "BLOCKED: a Lighter auth token is being added"; fail=1
+fi
+
+[ $fail -eq 0 ] || { echo "Commit aborted. Remove the secret (or 'git commit --no-verify' if it's a false positive you're sure about)."; exit 1; }

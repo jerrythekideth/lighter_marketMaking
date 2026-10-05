@@ -108,6 +108,17 @@ tools/stop.sh --shutdown                           # same, then shut the Mac dow
 Weekly: check your address in the "Rewards …" tab of the spreadsheet on Mondays and compare
 LIT earned × LIT price against the week's trading PnL. That number decides whether to scale up.
 
+## Secrets
+
+The only secret is the API private key, in `.env` (gitignored, never committed — checked across
+all history). Nothing in the repo identifies the account: the account index and key are read
+from `.env` at runtime, and the wallet address is looked up from the API. After cloning, enable
+the pre-commit check that blocks env files, the real `.env` values and key-shaped strings:
+
+```bash
+git config core.hooksPath tools/hooks
+```
+
 ## Layout
 
 ```
