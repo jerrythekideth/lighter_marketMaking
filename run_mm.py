@@ -34,7 +34,7 @@ import time
 from src.config import CONFIG
 from src.feed import MarketFeed
 from src.rewards import current_week
-from src.risk import DailyLoss, MarketGuard, book_problem, recent_trips
+from src.risk import STATE_PATH, DailyLoss, MarketGuard, book_problem, recent_trips
 from src.sessions import ASSET_CLASS, BLACKOUT, REDUCE_ONLY, session_state
 from src.strategy import (
     compute_quote, half_edge_bps, is_dangerous, needs_requote, sides_allowed, unwind_price,
@@ -76,7 +76,9 @@ class Bot:
         self.active = active
         self.active_ids = {m for _, m in active}
         self.feed = MarketFeed(self.cfg.ws_url, [m for _, m in active])
-        self.daily = DailyLoss(self.cfg.daily_loss_limit_usd)
+        # Dry runs keep their own loss state so they never read or modify the live bot's.
+        self.daily = DailyLoss(self.cfg.daily_loss_limit_usd,
+                               path=STATE_PATH.replace(".json", ".dry.json") if self.cfg.dry_run else STATE_PATH)
         self.guards = {m: MarketGuard() for _, m in active}
         self.vols: dict[int, float | None] = {}
         self.status: dict[int, str] = {}

@@ -58,7 +58,14 @@ class FakeFeed:
 def bot(tmp_path, monkeypatch):
     cfg = dataclasses.replace(CONFIG, dry_run=True, markets=("SOL",), max_order_usd=20, max_position_usd=40,
                               max_gross_usd=150, daily_loss_limit_usd=10, min_edge_bps=1.0, edge_vol_mult=0.1,
-                              requote_bps=1.0, max_paid_tx_per_min=100, account_refresh_s=0, api_key_private_key="")
+                              requote_bps=1.0, max_paid_tx_per_min=100, account_refresh_s=0, api_key_private_key="",
+                              # pin everything a personal .env might change, so tests don't depend on it
+                              skew_bps_at_cap=4, defensive_hours_utc="", market_params={}, require_rewarded=True,
+                              improve_spread_bps=10, quota_reserve=300, max_book_spread_bps=150,
+                              max_mark_divergence_bps=100, breaker_bps_min=40, breaker_vol_mult=2.0,
+                              breaker_window_s=30, breaker_pause_s=300, systemic_trip_count=3,
+                              min_free_margin_frac=0.3, session_lead_minutes=10, max_tx_errors=8,
+                              feed_max_silence_s=10, flatten_on_stop=True, hard_max_order_usd=0)
     monkeypatch.setattr(run_mm, "STOP_FILE", str(tmp_path / "STOP"))
     monkeypatch.setattr(run_mm, "session_state", lambda sym, now, lead: (OPEN, ""))
     t = FakeTrader(cfg)
@@ -219,6 +226,8 @@ def test_fill_then_requote_uses_exchange_truth(bot):
     # Simulate the ask getting filled: exchange no longer has it, position is now short.
     ask = next(o for o in bot_orders(bot) if o.is_ask)
     bot.t._paper.pop(ask.client_order_index)
+    # The fill is seen on the exchange after the 5s "trust our own recent placements" window.
+    bot._recent_placed = {k: (t - run_mm.RECENT_TX_SECONDS - 1, o) for k, (t, o) in bot._recent_placed.items()}
     bot.t.acct.positions = {SOL.market_id: Position(size=-0.166, value_usd=-20.0, unrealized_pnl=0)}
     run(bot.step())
     orders = bot_orders(bot)
