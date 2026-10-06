@@ -292,12 +292,16 @@ class Bot:
                          else global_reduce)
         p = lambda name: self.cfg.for_market(symbol, name)  # per-market override or global
         order_usd, max_pos = p("max_order_usd"), p("max_position_usd")
+        defensive = self.cfg.in_defensive_hours(now_utc.hour)
+        if defensive:
+            order_usd = min(order_usd, self.cfg.defensive_order_usd)
         edge = half_edge_bps(vol, p("min_edge_bps"), p("edge_vol_mult"))
         q = compute_quote(st.bid, st.ask, st.mid, spec.price_decimals, edge, pos,
                           max_pos, p("skew_bps_at_cap"), self.cfg.improve_spread_bps)
         bid_ok, ask_ok = sides_allowed(pos, order_usd, max_pos, reduce_reason is not None)
         size = min(order_usd, abs(pos)) if reduce_reason else order_usd
-        self._set_status(symbol, m, f"REDUCE-ONLY ({reduce_reason})" if reduce_reason else "QUOTING")
+        self._set_status(symbol, m, f"REDUCE-ONLY ({reduce_reason})" if reduce_reason
+                         else "QUOTING (defensive size)" if defensive else "QUOTING")
 
         reduce = reduce_reason is not None
         await self._reconcile_side(symbol, m, False, q.bid if bid_ok else None, size, reduce)

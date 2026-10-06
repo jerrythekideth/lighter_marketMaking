@@ -67,6 +67,13 @@ class Config:
     # sizing can never send more than this. Default: 2x the largest configured order size.
     hard_max_order_usd: float = field(default_factory=lambda: _float("HARD_MAX_ORDER_USD", 0))
 
+    # Defensive hours (UTC, "start-end", e.g. "12-20"): orders shrink to DEFENSIVE_ORDER_USD
+    # instead of pausing, so the bot keeps collecting reward snapshots 24/7 at lower cost.
+    # Measured 2026-10-03..06: ~60% of ANTHROPIC's adverse-selection loss came from 12-20 UTC
+    # (US trading hours), at 2-5x the per-fill cost of the rest of the day. "" = off.
+    defensive_hours_utc: str = field(default_factory=lambda: os.getenv("DEFENSIVE_HOURS_UTC", ""))
+    defensive_order_usd: float = field(default_factory=lambda: _float("DEFENSIVE_ORDER_USD", 12))
+
     # --- quoting ---
     # Half-spread floor from fair price: max(MIN_EDGE_BPS, EDGE_VOL_MULT * 1h volatility bps).
     # Within that floor the bot joins the best bid/ask (where liquidity rewards are highest).
@@ -124,6 +131,12 @@ class Config:
             raise KeyError(name)
         return float((self.market_params.get(symbol) or {}).get(name, getattr(self, name)))
 
+    def in_defensive_hours(self, hour_utc: int) -> bool:
+        if not self.defensive_hours_utc:
+            return False
+        start, end = (int(x) for x in self.defensive_hours_utc.split("-"))
+        return start <= hour_utc < end if start <= end else (hour_utc >= start or hour_utc < end)
+
     def order_ceiling_usd(self) -> float:
         if self.hard_max_order_usd > 0:
             return self.hard_max_order_usd
@@ -140,6 +153,10 @@ class Config:
             order, pos = self.for_market(sym, "max_order_usd"), self.for_market(sym, "max_position_usd")
             if order <= 0 or pos < order:
                 raise ValueError(f"{sym}: need 0 < max_order_usd ({order}) <= max_position_usd ({pos})")
+        if self.defensive_hours_utc:
+            a, b = (int(x) for x in self.defensive_hours_utc.split("-"))
+            if not (0 <= a <= 23 and 0 <= b <= 24):
+                raise ValueError("DEFENSIVE_HOURS_UTC must look like 12-20")
         if self.daily_loss_limit_usd <= 0:
             raise ValueError("DAILY_LOSS_LIMIT_USD must be > 0")
 

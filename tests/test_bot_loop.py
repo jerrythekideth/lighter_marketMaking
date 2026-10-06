@@ -415,3 +415,28 @@ def test_per_market_requote_threshold(bot):
     run(bot.step())
     after = {o.client_order_index: o.price for o in bot_orders(bot)}
     assert after.keys() == before.keys() and after != before
+
+
+def test_defensive_hours_shrink_orders_but_keep_quoting(bot, monkeypatch):
+    import datetime as _dt
+    bot.cfg = dataclasses.replace(bot.cfg, max_order_usd=25, max_position_usd=60,
+                                  defensive_hours_utc="12-20", defensive_order_usd=12)
+
+    class Clock(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return _dt.datetime(2026, 10, 7, 14, 0, tzinfo=_dt.timezone.utc)
+    monkeypatch.setattr(run_mm.dt, "datetime", Clock)
+    run(bot.step())
+    orders = bot_orders(bot)
+    assert len(orders) == 2 and all(o.remaining_base * o.price <= 12.5 for o in orders)
+    assert bot.status[SOL.market_id] == "QUOTING (defensive size)"
+
+
+def test_defensive_window_parsing():
+    from src.config import CONFIG
+    c = dataclasses.replace(CONFIG, defensive_hours_utc="12-20")
+    assert c.in_defensive_hours(12) and c.in_defensive_hours(19) and not c.in_defensive_hours(20)
+    c = dataclasses.replace(CONFIG, defensive_hours_utc="22-4")           # wraps midnight
+    assert c.in_defensive_hours(23) and c.in_defensive_hours(3) and not c.in_defensive_hours(12)
+    assert not dataclasses.replace(CONFIG, defensive_hours_utc="").in_defensive_hours(14)
